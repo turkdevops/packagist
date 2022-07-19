@@ -2,8 +2,11 @@
 
 namespace App\Twig;
 
+use App\Entity\Package;
+use App\Entity\PackageLink;
 use App\Model\ProviderManager;
 use App\Security\RecaptchaHelper;
+use Composer\Pcre\Preg;
 use Symfony\Component\HttpFoundation\RequestStack;
 use Composer\Repository\PlatformRepository;
 use Twig\Extension\AbstractExtension;
@@ -24,7 +27,7 @@ class PackagistExtension extends AbstractExtension
         $this->requestStack = $requestStack;
     }
 
-    public function getTests()
+    public function getTests(): array
     {
         return [
             new TwigTest('existing_package', [$this, 'packageExistsTest']),
@@ -33,7 +36,7 @@ class PackagistExtension extends AbstractExtension
         ];
     }
 
-    public function getFilters()
+    public function getFilters(): array
     {
         return [
             new TwigFilter('prettify_source_reference', [$this, 'prettifySourceReference']),
@@ -43,70 +46,86 @@ class PackagistExtension extends AbstractExtension
         ];
     }
 
-    public function getFunctions()
+    public function getFunctions(): array
     {
         return [
             new TwigFunction('requires_recaptcha', [$this, 'requiresRecaptcha']),
         ];
     }
 
-    public function getName()
+    public function getName(): string
     {
         return 'packagist';
     }
 
     public function getVendor(string $packageName): string
     {
-        return preg_replace('{/.*$}', '', $packageName);
+        return Preg::replace('{/.*$}', '', $packageName);
     }
 
-    public function numericTest($val)
+    public function numericTest(mixed $val): bool
     {
+        if (!is_string($val) && !is_int($val)) {
+            return false;
+        }
+
         return ctype_digit((string) $val);
     }
 
-    public function packageExistsTest($package)
+    public function packageExistsTest(mixed $package): bool
     {
-        if (!preg_match('/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/', $package)) {
+        if (!is_string($package)) {
+            return false;
+        }
+
+        if (!Preg::isMatch('/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/', $package)) {
             return false;
         }
 
         return $this->providerManager->packageExists($package);
     }
 
-    public function providerExistsTest($package)
+    public function providerExistsTest(mixed $package): bool
     {
+        if (!is_string($package)) {
+            return false;
+        }
+
         return $this->providerManager->packageIsProvided($package);
     }
 
-    public function prettifySourceReference($sourceReference)
+    public function prettifySourceReference(string $sourceReference): string
     {
-        if (preg_match('/^[a-f0-9]{40}$/', $sourceReference)) {
+        if (Preg::isMatch('/^[a-f0-9]{40}$/', $sourceReference)) {
             return substr($sourceReference, 0, 7);
         }
 
         return $sourceReference;
     }
 
-    public function generateGravatarHash($email)
+    public function generateGravatarHash(string $email): string
     {
         return md5(strtolower($email));
     }
 
-    public function sortLinks(array $links)
+    /**
+     * @param PackageLink[] $links
+     * @return PackageLink[]
+     */
+    public function sortLinks(array $links): array
     {
-        usort($links, function ($a, $b) {
-            $aPlatform = preg_match(PlatformRepository::PLATFORM_PACKAGE_REGEX, $a->getPackageName());
-            $bPlatform = preg_match(PlatformRepository::PLATFORM_PACKAGE_REGEX, $b->getPackageName());
+        usort($links, function (PackageLink $a, PackageLink $b) {
+            $aPlatform = Preg::isMatch(PlatformRepository::PLATFORM_PACKAGE_REGEX, $a->getPackageName());
+            $bPlatform = Preg::isMatch(PlatformRepository::PLATFORM_PACKAGE_REGEX, $b->getPackageName());
 
             if ($aPlatform !== $bPlatform) {
                 return $aPlatform ? -1 : 1;
             }
 
-            if (preg_match('{^php(?:-64bit|-ipv6|-zts|-debug)?$}iD', $a->getPackageName())) {
+            if (Preg::isMatch('{^php(?:-64bit|-ipv6|-zts|-debug)?$}iD', $a->getPackageName())) {
                 return -1;
             }
-            if (preg_match('{^php(?:-64bit|-ipv6|-zts|-debug)?$}iD', $b->getPackageName())) {
+            if (Preg::isMatch('{^php(?:-64bit|-ipv6|-zts|-debug)?$}iD', $b->getPackageName())) {
                 return 1;
             }
 
@@ -118,6 +137,12 @@ class PackagistExtension extends AbstractExtension
 
     public function requiresRecaptcha(?string $username): bool
     {
-        return $this->recaptchaHelper->requiresRecaptcha($this->requestStack->getCurrentRequest()->getClientIp(), $username);
+        $clientIp = $this->requestStack->getCurrentRequest()?->getClientIp();
+
+        if (null === $clientIp || null === $username) {
+            return false;
+        }
+
+        return $this->recaptchaHelper->requiresRecaptcha($clientIp, $username);
     }
 }

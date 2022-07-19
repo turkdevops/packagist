@@ -16,10 +16,10 @@ use App\Entity\UserRepository;
 use App\Util\DoctrineTrait;
 use Doctrine\Persistence\ManagerRegistry;
 use App\Entity\User;
+use Symfony\Component\Security\Core\Exception\UserNotFoundException;
 use Symfony\Component\Security\Core\User\PasswordUpgraderInterface;
 use Symfony\Component\Security\Core\User\UserInterface;
 use Symfony\Component\Security\Core\User\UserProviderInterface;
-use App\Service\Scheduler;
 
 class UserProvider implements UserProviderInterface, PasswordUpgraderInterface
 {
@@ -27,50 +27,59 @@ class UserProvider implements UserProviderInterface, PasswordUpgraderInterface
 
     private ManagerRegistry $doctrine;
 
-    private Scheduler $scheduler;
-
-    public function __construct(ManagerRegistry $doctrine, Scheduler $scheduler)
+    public function __construct(ManagerRegistry $doctrine)
     {
         $this->doctrine = $doctrine;
-        $this->scheduler = $scheduler;
+    }
+
+    public function loadUserByIdentifier(string $usernameOrEmail): User
+    {
+        $user = $this->getRepo()->findOneByUsernameOrEmail($usernameOrEmail);
+
+        if (null === $user) {
+            throw new UserNotFoundException();
+        }
+
+        return $user;
+    }
+
+    // TODO delete in Symfony6
+    public function loadUserByUsername(string $usernameOrEmail): User
+    {
+        return $this->loadUserByIdentifier($usernameOrEmail);
     }
 
     /**
      * @inheritDoc
      */
-    public function loadUserByUsername($usernameOrEmail)
-    {
-        return $this->getRepo()->findOneByUsernameOrEmail((string) $usernameOrEmail);
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function refreshUser(UserInterface $user)
+    public function refreshUser(UserInterface $user): User
     {
         if (!$user instanceof User) {
             throw new \UnexpectedValueException('Expected '.User::class.', got '.get_class($user));
         }
 
-        return $this->getRepo()->find($user->getId());
+        $user = $this->getRepo()->find($user->getId());
+        if (null === $user) {
+            throw new \RuntimeException('The user could not be reloaded as it does not exist anymore in the database');
+        }
+
+        return $user;
     }
 
-    public function upgradePassword(UserInterface $user, string $newEncodedPassword): void
+    public function upgradePassword(UserInterface $user, string $newHashedPassword): void
     {
         if (!$user instanceof User) {
             throw new \UnexpectedValueException('Expected '.User::class.', got '.get_class($user));
         }
 
-        $user->setPassword($newEncodedPassword);
+        $user->setPassword($newHashedPassword);
+        $user->setSalt(null);
 
         $this->getEM()->persist($user);
         $this->getEM()->flush();
     }
 
-    /**
-     * @inheritDoc
-     */
-    public function supportsClass($class)
+    public function supportsClass(string $class): bool
     {
         return User::class === $class || is_subclass_of($class, User::class);
     }

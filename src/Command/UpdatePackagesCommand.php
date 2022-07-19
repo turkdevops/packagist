@@ -41,7 +41,7 @@ class UpdatePackagesCommand extends Command
         parent::__construct();
     }
 
-    protected function configure()
+    protected function configure(): void
     {
         $this
             ->setName('packagist:update')
@@ -65,7 +65,7 @@ class UpdatePackagesCommand extends Command
         $updateEqualRefs = false;
         $randomTimes = true;
 
-        if (!$this->locker->lockCommand($this->getName())) {
+        if (!$this->locker->lockCommand(__CLASS__)) {
             if ($verbose) {
                 $output->writeln('Aborting, another task is running already');
             }
@@ -73,7 +73,12 @@ class UpdatePackagesCommand extends Command
         }
 
         if ($package) {
-            $packages = [['id' => $this->getEM()->getRepository(Package::class)->findOneBy(['name' => $package])->getId()]];
+            $packageEntity = $this->getEM()->getRepository(Package::class)->findOneBy(['name' => $package]);
+            if ($packageEntity === null) {
+                $output->writeln('<error>Package '.$package.' not found</error>');
+                return 1;
+            }
+            $packages = [['id' => $packageEntity->getId()]];
             if ($force) {
                 $updateEqualRefs = true;
             }
@@ -110,7 +115,7 @@ class UpdatePackagesCommand extends Command
             }
         }
 
-        $this->locker->unlockCommand($this->getName());
+        $this->locker->unlockCommand(__CLASS__);
 
         return 0;
     }

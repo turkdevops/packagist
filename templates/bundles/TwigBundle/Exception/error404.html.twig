@@ -12,4 +12,8 @@
 </section>
 {% endblock %}
 
-{% block analytics %}{% endblock %}
+{% block script_init %}
+<script nonce="{{ csp_nonce('script') }}">
+    var trackPageload = false;
+</script>
+{% endblock %}

@@ -14,12 +14,15 @@ namespace App\Entity;
 
 use Doctrine\Common\Collections\ArrayCollection;
 use Doctrine\Common\Collections\Collection;
+use Doctrine\Common\Collections\Selectable;
 use Doctrine\ORM\Mapping as ORM;
 use Scheb\TwoFactorBundle\Model\BackupCodeInterface;
 use Scheb\TwoFactorBundle\Model\Totp\TotpConfiguration;
 use Scheb\TwoFactorBundle\Model\Totp\TotpConfigurationInterface;
 use Scheb\TwoFactorBundle\Model\Totp\TwoFactorInterface;
 use Symfony\Bridge\Doctrine\Validator\Constraints\UniqueEntity;
+use Symfony\Component\Security\Core\User\LegacyPasswordAuthenticatedUserInterface;
+use Symfony\Component\Security\Core\User\PasswordAuthenticatedUserInterface;
 use Symfony\Component\Validator\Constraints as Assert;
 use Symfony\Component\Security\Core\User\EquatableInterface;
 use Symfony\Component\Security\Core\User\UserInterface;
@@ -32,14 +35,14 @@ use DateTimeInterface;
  * @UniqueEntity(fields={"usernameCanonical"}, message="There is already an account with this username", errorPath="username")
  * @UniqueEntity(fields={"emailCanonical"}, message="There is already an account with this email", errorPath="email")
  */
-class User implements UserInterface, Serializable, TwoFactorInterface, BackupCodeInterface, EquatableInterface
+class User implements UserInterface, Serializable, TwoFactorInterface, BackupCodeInterface, EquatableInterface, PasswordAuthenticatedUserInterface, LegacyPasswordAuthenticatedUserInterface
 {
     /**
      * @ORM\Id
      * @ORM\GeneratedValue
      * @ORM\Column(type="integer")
      */
-    private $id;
+    private int $id;
 
     /**
      * @ORM\Column(type="string", length=191)
@@ -52,13 +55,13 @@ class User implements UserInterface, Serializable, TwoFactorInterface, BackupCod
      * @Assert\NotBlank(groups={"Profile", "Registration"})
      * @var string
      */
-    private $username;
+    private string $username;
 
     /**
      * @ORM\Column(type="string", name="username_canonical", length=191, unique=true)
      * @var string
      */
-    private $usernameCanonical;
+    private string $usernameCanonical;
 
     /**
      * @ORM\Column(type="string", length=191)
@@ -66,60 +69,61 @@ class User implements UserInterface, Serializable, TwoFactorInterface, BackupCod
      * @Assert\Email(groups={"Profile", "Registration"})
      * @Assert\NotBlank(groups={"Profile", "Registration"})
      */
-    private $email;
+    private string $email;
 
     /**
      * @ORM\Column(type="string", name="email_canonical", length=191, unique=true)
      * @var string
      */
-    private $emailCanonical;
+    private string $emailCanonical;
 
     /**
      * @ORM\Column(type="boolean")
      * @var bool
      */
-    private $enabled = false;
+    private bool $enabled = false;
 
     /**
      * @ORM\Column(type="array")
+     * @var list<string>
      */
-    private $roles = [];
+    private array $roles = [];
 
     /**
      * @var string The hashed password
      * @ORM\Column(type="string")
      */
-    private $password;
+    private string $password;
 
     /**
      * The salt to use for hashing.
      *
      * @ORM\Column(type="string", nullable=true)
      */
-    private ?string $salt = null;
+    private string|null $salt = null;
 
     /**
      * @ORM\Column(type="datetime", name="last_login", nullable=true)
      */
-    private ?DateTimeInterface $lastLogin = null;
+    private DateTimeInterface|null $lastLogin = null;
 
     /**
      * Random string sent to the user email address in order to verify it.
      *
      * @ORM\Column(type="string", name="confirmation_token", length=180, nullable=true, unique=true)
      */
-    private ?string $confirmationToken = null;
+    private string|null $confirmationToken = null;
 
     /**
      * @ORM\Column(type="datetime", name="password_requested_at", nullable=true)
      */
-    private ?DateTimeInterface $passwordRequestedAt = null;
+    private DateTimeInterface|null $passwordRequestedAt = null;
 
     /**
      * @ORM\ManyToMany(targetEntity="Package", mappedBy="maintainers")
-     * @var Collection<Package>
+     * @var Collection<int, Package>&Selectable<int, Package>
      */
-    private $packages;
+    private Collection $packages;
 
     /**
      * @ORM\Column(type="datetime")
@@ -134,17 +138,17 @@ class User implements UserInterface, Serializable, TwoFactorInterface, BackupCod
     /**
      * @ORM\Column(type="string", length=255, nullable=true)
      */
-    private ?string $githubId = null;
+    private string|null $githubId = null;
 
     /**
      * @ORM\Column(type="string", length=255, nullable=true)
      */
-    private ?string $githubToken = null;
+    private string|null $githubToken = null;
 
     /**
      * @ORM\Column(type="string", length=255, nullable=true)
      */
-    private ?string $githubScope = null;
+    private string|null $githubScope = null;
 
     /**
      * @ORM\Column(type="boolean", options={"default"=true})
@@ -154,12 +158,12 @@ class User implements UserInterface, Serializable, TwoFactorInterface, BackupCod
     /**
      * @ORM\Column(name="totpSecret", type="string", nullable=true)
      */
-    private ?string $totpSecret = null;
+    private string|null $totpSecret = null;
 
     /**
      * @ORM\Column(type="string", length=8, nullable=true)
      */
-    private ?string $backupCode = null;
+    private string|null $backupCode = null;
 
     public function __construct()
     {
@@ -167,7 +171,6 @@ class User implements UserInterface, Serializable, TwoFactorInterface, BackupCod
         $this->roles = array();
         $this->packages = new ArrayCollection();
         $this->createdAt = new \DateTimeImmutable();
-        $this->salt = hash('sha256', random_bytes(40));
     }
 
     public function __toString(): string
@@ -175,6 +178,9 @@ class User implements UserInterface, Serializable, TwoFactorInterface, BackupCod
         return (string) $this->getUsername();
     }
 
+    /**
+     * @return array{name: string, avatar_url: string}
+     */
     public function toArray(): array
     {
         return [
@@ -183,13 +189,13 @@ class User implements UserInterface, Serializable, TwoFactorInterface, BackupCod
         ];
     }
 
-    public function addPackage(Package $packages)
+    public function addPackage(Package $packages): void
     {
         $this->packages[] = $packages;
     }
 
     /**
-     * @return Collection<Package>
+     * @return Collection<int, Package>&Selectable<int, Package>
      */
     public function getPackages(): Collection
     {
@@ -211,12 +217,12 @@ class User implements UserInterface, Serializable, TwoFactorInterface, BackupCod
         return $this->apiToken;
     }
 
-    public function getGithubId(): ?string
+    public function getGithubId(): string|null
     {
         return $this->githubId;
     }
 
-    public function getGithubUsername(): ?string
+    public function getGithubUsername(): string|null
     {
         if ($this->githubId) {
             if (!$this->githubToken) {
@@ -235,27 +241,27 @@ class User implements UserInterface, Serializable, TwoFactorInterface, BackupCod
         return null;
     }
 
-    public function setGithubId(?string $githubId): void
+    public function setGithubId(string|null $githubId): void
     {
         $this->githubId = $githubId;
     }
 
-    public function getGithubToken(): ?string
+    public function getGithubToken(): string|null
     {
         return $this->githubToken;
     }
 
-    public function setGithubToken(?string $githubToken): void
+    public function setGithubToken(string|null $githubToken): void
     {
         $this->githubToken = $githubToken;
     }
 
-    public function getGithubScope(): ?string
+    public function getGithubScope(): string|null
     {
         return $this->githubScope;
     }
 
-    public function setGithubScope(?string $githubScope): void
+    public function setGithubScope(string|null $githubScope): void
     {
         $this->githubScope = $githubScope;
     }
@@ -280,7 +286,7 @@ class User implements UserInterface, Serializable, TwoFactorInterface, BackupCod
         return 'https://www.gravatar.com/avatar/'.md5(strtolower($this->getEmail())).'?d=identicon';
     }
 
-    public function setTotpSecret(?string $secret): void
+    public function setTotpSecret(string|null $secret): void
     {
         $this->totpSecret = $secret;
     }
@@ -356,52 +362,57 @@ class User implements UserInterface, Serializable, TwoFactorInterface, BackupCod
             $this->usernameCanonical,
             $this->username,
             $this->enabled,
-            $this->id,
-            $this->email,
+            $this->id, // @phpstan-ignore-line
+            $this->email, // @phpstan-ignore-line
             $this->emailCanonical
         ) = $data;
     }
 
-    public function eraseCredentials()
+    public function eraseCredentials(): void
     {
     }
 
-    public function getId(): ?int
+    public function getId(): int
     {
         return $this->id;
     }
 
-    public function getUsername(): ?string
-    {
-        return $this->username;
-    }
-
-    public function getUsernameCanonical(): ?string
+    public function getUserIdentifier(): string
     {
         return $this->usernameCanonical;
     }
 
-    public function getSalt(): ?string
+    public function getUsername(): string
+    {
+        return $this->username;
+    }
+
+    public function getUsernameCanonical(): string
+    {
+        return $this->usernameCanonical;
+    }
+
+    public function getSalt(): string|null
     {
         return $this->salt;
     }
 
-    public function getEmail(): ?string
+    public function getEmail(): string
     {
         return $this->email;
     }
 
-    public function getEmailCanonical(): ?string
+    public function getEmailCanonical(): string
     {
         return $this->emailCanonical;
     }
 
-    public function getPassword(): ?string
+    public function getPassword(): string|null
     {
         return $this->password;
     }
 
-    public function getLastLogin(): ?DateTimeInterface
+    public function getLastLogin(): DateTimeInterface|null
     {
         return $this->lastLogin;
     }
@@ -437,15 +448,15 @@ class User implements UserInterface, Serializable, TwoFactorInterface, BackupCod
         }
     }
 
-    public function setUsername(?string $username)
+    public function setUsername(string $username): void
     {
         $this->username = $username;
         $this->setUsernameCanonical($username);
     }
 
-    public function setUsernameCanonical(?string $usernameCanonical): void
+    public function setUsernameCanonical(string $usernameCanonical): void
     {
-        $this->usernameCanonical = null === $usernameCanonical ? null : mb_strtolower($usernameCanonical);
+        $this->usernameCanonical = mb_strtolower($usernameCanonical);
     }
 
     public function setSalt($salt): void
@@ -453,15 +464,15 @@ class User implements UserInterface, Serializable, TwoFactorInterface, BackupCod
         $this->salt = $salt;
     }
 
-    public function setEmail(?string $email): void
+    public function setEmail(string $email): void
     {
         $this->email = $email;
         $this->setEmailCanonical($email);
     }
 
-    public function setEmailCanonical(?string $emailCanonical): void
+    public function setEmailCanonical(string $emailCanonical): void
     {
-        $this->emailCanonical = null === $emailCanonical ? null : mb_strtolower($emailCanonical);
+        $this->emailCanonical = mb_strtolower($emailCanonical);
     }
 
     public function setEnabled(bool $boolean): void
@@ -469,17 +480,17 @@ class User implements UserInterface, Serializable, TwoFactorInterface, BackupCod
         $this->enabled = $boolean;
     }
 
-    public function setPassword(?string $password): void
+    public function setPassword(string $password): void
     {
         $this->password = $password;
     }
 
-    public function setLastLogin(?DateTimeInterface $time = null): void
+    public function setLastLogin(DateTimeInterface|null $time = null): void
     {
         $this->lastLogin = $time;
     }
 
-    public function setPasswordRequestedAt(?DateTimeInterface $date = null): void
+    public function setPasswordRequestedAt(DateTimeInterface|null $date = null): void
     {
         $this->passwordRequestedAt = $date;
     }
@@ -487,11 +498,14 @@ class User implements UserInterface, Serializable, TwoFactorInterface, BackupCod
     /**
      * Gets the timestamp that the user requested a password reset.
      */
-    public function getPasswordRequestedAt(): ?DateTimeInterface
+    public function getPasswordRequestedAt(): DateTimeInterface|null
     {
         return $this->passwordRequestedAt;
     }
 
+    /**
+     * @param list<string> $roles
+     */
     public function setRoles(array $roles): void
     {
         $this->roles = array();
@@ -501,7 +515,7 @@ class User implements UserInterface, Serializable, TwoFactorInterface, BackupCod
         }
     }
 
-    public function isEqualTo(UserInterface $user)
+    public function isEqualTo(UserInterface $user): bool
     {
         if (!$user instanceof User) {
             return false;
@@ -531,7 +545,7 @@ class User implements UserInterface, Serializable, TwoFactorInterface, BackupCod
         $this->apiToken = substr(hash('sha256', random_bytes(20)), 0, 20);
     }
 
-    public function getConfirmationToken(): ?string
+    public function getConfirmationToken(): string|null
     {
         return $this->confirmationToken;
     }

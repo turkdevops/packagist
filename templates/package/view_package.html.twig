@@ -21,10 +21,6 @@
     {% endif %}
 {% endblock %}
 
-{% block scripts %}
-    <script src="{{ asset('js/view.js')}}"></script>
-{% endblock %}
-
 {% block description -%}
     {{ package.description|u.truncate(300) }}
 {%- endblock %}
@@ -32,7 +28,7 @@
 {% set hasActions = is_granted('ROLE_EDIT_PACKAGES') or is_granted('ROLE_ANTISPAM') or is_granted('ROLE_UPDATE_PACKAGES') or package.maintainers.contains(app.user) %}
 
 {% block content %}
-    <div class="row">
+    <div class="row" id="view-package-page">
         <div class="col-xs-12 package"{% if app.user and package.crawledAt is null and (is_granted('ROLE_EDIT_PACKAGES') or package.maintainers.contains(app.user)) %} data-force-crawl="true"{% endif %}>
             <div class="package-header">
 
@@ -58,10 +54,6 @@
                         {% elseif "bitbucket.org" in package.repository %}
                             <div class="alert alert-danger">This package is not auto-updated. Please set up the <a href="{{ path('about') }}#how-to-update-packages">BitBucket Webhooks</a> for Packagist so that it gets updated whenever you push!</div>
                         {% endif %}
-                    {% endif %}
-
-                    {% if isVisibleToV1 is defined and isVisibleToV1 == false %}
-                        <div class="alert alert-warning">This package is not installable via Composer 1.x, please make sure you <a href="https://getcomposer.org/2">upgrade</a> to Composer 2+. <a href="https://blog.packagist.com/deprecating-composer-1-support/">Read more about our Composer 1.x deprecation policy.</a></div>
                     {% endif %}
 
                     {% if package.abandoned %}
@@ -124,7 +116,7 @@
                             {% endif %}
                             {% if is_granted('ROLE_ANTISPAM') and package.isSuspect() %}
                                 <form class="action" action="{{ path("mark_nospam") }}" method="POST">
-                                    <input type="hidden" name="vendor" value="{{ package.vendor }}" />
+                                    <input type="hidden" name="vendor[]" value="{{ package.vendor }}" />
                                     <input type="hidden" name="token" value="{{ markSafeCsrfToken }}" />
                                     <input class="btn btn-danger" type="submit" value="Mark Not Spam" />
                                 </form>

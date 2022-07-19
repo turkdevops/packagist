@@ -1,7 +1,9 @@
+/node_modules/
 web/packages*.json
 web/providers-*.json
 web/p/
 web/p2/
+web/build/
 /config/parameters.yml
 /.settings
 /.buildpath
@@ -10,6 +12,7 @@ web/p2/
 /composer.phar
 /nbproject
 /.php_cs.cache
+/.phpstan-dba.cache
 
 ###> symfony/framework-bundle ###
 /.env.local
@@ -26,3 +29,8 @@ web/p2/
 .phpunit.result.cache
 /phpunit.xml
 ###< symfony/phpunit-bridge ###
+
+###> phpunit/phpunit ###
+/phpunit.xml
+.phpunit.result.cache
+###< phpunit/phpunit ###

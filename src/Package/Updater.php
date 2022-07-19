@@ -15,9 +15,11 @@ namespace App\Package;
 use App\Entity\Dependent;
 use cebe\markdown\GithubMarkdown;
 use Composer\Package\AliasPackage;
+use Composer\Pcre\Preg;
 use Composer\Repository\RepositoryInterface;
 use Composer\Repository\VcsRepository;
 use Composer\Repository\Vcs\GitHubDriver;
+use Composer\Repository\Vcs\VcsDriverInterface;
 use Composer\Repository\InvalidRepositoryException;
 use Composer\Util\ErrorHandler;
 use Composer\Util\HttpDownloader;
@@ -46,10 +48,7 @@ class Updater
     const DELETE_BEFORE = 2;
     const FORCE_DUMP = 4;
 
-    /**
-     * Supported link types
-     */
-    protected array $supportedLinkTypes = [
+    private const SUPPORTED_LINK_TYPES = [
         'require'     => [
             'method' => 'getRequires',
             'entity' => 'RequireLink',
@@ -72,15 +71,10 @@ class Updater
         ],
     ];
 
-    /**
-     * Constructor
-     *
-     * @param ManagerRegistry $doctrine
-     */
     public function __construct(
         private ManagerRegistry $doctrine,
         private ProviderManager $providerManager,
-        private VersionIdCache $versionIdCache
+        private VersionIdCache $versionIdCache,
     ) {
         ErrorHandler::register();
     }
@@ -92,7 +86,7 @@ class Updater
      * @param VcsRepository $repository the repository instance used to update from
      * @param int $flags a few of the constants of this class
      */
-    public function update(IOInterface $io, Config $config, Package $package, VcsRepository $repository, $flags = 0, array $existingVersions = null, VersionCache $versionCache = null): Package
+    public function update(IOInterface $io, Config $config, Package $package, VcsRepository $repository, int $flags = 0, array $existingVersions = null, VersionCache $versionCache = null): Package
     {
         $httpDownloader = new HttpDownloader($io, $config);
 
@@ -102,11 +96,12 @@ class Updater
         $em = $this->getEM();
         $rootIdentifier = null;
 
-        if (!$repository->getDriver()) {
+        $driver = $repository->getDriver();
+        if (!$driver) {
             throw new \RuntimeException('Driver could not be established for package '.$package->getName().' ('.$package->getRepository().')');
         }
 
-        $rootIdentifier = $repository->getDriver()->getRootIdentifier();
+        $rootIdentifier = $driver->getRootIdentifier();
 
         // always update the master branch / root identifier, as in case a package gets archived
         // we want to mark it abandoned automatically, but there will not be a new commit to trigger
@@ -184,25 +179,26 @@ class Updater
             $processedVersions[strtolower($version->getVersion())] = $version;
 
             $result = $this->updateInformation($io, $versionRepository, $package, $existingVersions, $version, $flags, $rootIdentifier);
-            $lastUpdated = $result['updated'];
-
-            if ($lastUpdated) {
+            $versionId = false;
+            if ($result['updated']) {
+                assert($result['object'] instanceof Version);
                 $em->flush();
                 $em->clear();
                 $package = $em->merge($package);
 
                 $this->versionIdCache->insertVersion($package, $result['object']);
+                $versionId = $result['object']->getId();
             } else {
                 $idsToMarkUpdated[] = $result['id'];
             }
 
             // use the first version which should be the highest stable version by default
             if (null === $dependentSuggesterSource) {
-                $dependentSuggesterSource = $lastUpdated ? $result['object']->getId() : false;
+                $dependentSuggesterSource = $versionId;
             }
             // if default branch is present however we prefer that as the canonical source of dependent/suggester
             if ($version->isDefaultBranch()) {
-                $dependentSuggesterSource = $lastUpdated ? $result['object']->getId() : false;
+                $dependentSuggesterSource = $versionId;
             }
 
             // mark the version processed so we can prune leftover ones
@@ -210,37 +206,43 @@ class Updater
         }
 
         if ($dependentSuggesterSource) {
-            $em->getRepository(Dependent::class)->updateDependentSuggesters($package->getId(), $dependentSuggesterSource);
+            $this->doctrine->getRepository(Dependent::class)->updateDependentSuggesters($package->getId(), $dependentSuggesterSource);
         }
 
-        // mark versions that did not update as updated to avoid them being pruned
+        // make sure versions that are still present but did not update are not pruned
         $em->getConnection()->executeStatement(
-            'UPDATE package_version SET updatedAt = :now, softDeletedAt = NULL WHERE id IN (:ids)',
+            'UPDATE package_version SET updatedAt = :now, softDeletedAt = NULL WHERE id IN (:ids) AND softDeletedAt IS NOT NULL',
             ['now' => date('Y-m-d H:i:s'), 'ids' => $idsToMarkUpdated],
             ['ids' => Connection::PARAM_INT_ARRAY]
         );
 
         // remove outdated versions
         foreach ($existingVersions as $version) {
-            if (!is_null($version['softDeletedAt']) && new \DateTime($version['softDeletedAt']) < $deleteDate) {
-                $versionRepository->remove($versionRepository->find($version['id']));
-            } elseif ($version['normalizedVersion'] === '9999999-dev') {
-                // removed v1 normalized versions of dev-master/trunk/default immediately as they have been recreated as dev-master/trunk/default in a non-normalized way
-                $versionRepository->remove($versionRepository->find($version['id']));
-            } else {
-                // set it to be soft-deleted so next update that occurs after deleteDate (1day) if the
-                // version is still missing it will be really removed
-                $em->getConnection()->executeStatement(
-                    'UPDATE package_version SET softDeletedAt = :now WHERE id = :id',
-                    ['now' => date('Y-m-d H:i:s'), 'id' => $version['id']]
-                );
+            if (
+                // soft-deleted versions are really purged after a day
+                (!is_null($version['softDeletedAt']) && new \DateTime($version['softDeletedAt']) < $deleteDate)
+                // remove v1 normalized versions of dev-master/trunk/default immediately as they have been recreated as dev-master/trunk/default in a non-normalized way
+                || ($version['normalizedVersion'] === '9999999-dev')
+            ) {
+                $versionEntity = $versionRepository->find($version['id']);
+                if (null !== $versionEntity) {
+                    $versionRepository->remove($versionEntity);
+                }
+                continue;
             }
+
+            // set it to be soft-deleted so next update that occurs after deleteDate (1day) if the
+            // version is still missing it will be really removed
+            $em->getConnection()->executeStatement(
+                'UPDATE package_version SET softDeletedAt = :now WHERE id = :id',
+                ['now' => date('Y-m-d H:i:s'), 'id' => $version['id']]
+            );
         }
 
-        if (preg_match('{^(?:git://|git@|https?://)github.com[:/]([^/]+)/(.+?)(?:\.git|/)?$}i', $package->getRepository(), $match)) {
-            $this->updateGitHubInfo($httpDownloader, $package, $match[1], $match[2], $repository);
+        if (Preg::isMatch('{^(?:git://|git@|https?://)github.com[:/]([^/]+)/(.+?)(?:\.git|/)?$}i', $package->getRepository(), $match)) {
+            $this->updateGitHubInfo($httpDownloader, $package, $match[1], $match[2], $driver);
         } else {
-            $this->updateReadme($io, $package, $repository);
+            $this->updateReadme($io, $package, $driver);
         }
 
         // make sure the package exists in the package list if for some reason adding it on submit failed
@@ -265,16 +267,20 @@ class Updater
     }
 
     /**
-     * @return array with keys:
-     *                    - updated (whether the version was updated or needs to be marked as updated)
-     *                    - id (version id, can be null for newly created versions)
-     *                    - version (normalized version from the composer package)
-     *                    - object (Version instance if it was updated)
+     * Keys info:
+     *
+     *  - updated (whether the version was updated or needs to be marked as updated)
+     *  - id (version id, can be null for newly created versions)
+     *  - version (normalized version from the composer package)
+     *  - object (Version instance if it was updated)
+     *
+     * @return array{updated: true, id: int|null, version: string, object: Version}|array{updated: false, id: int|null, version: string, object: null}
      */
-    private function updateInformation(IOInterface $io, VersionRepository $versionRepo, Package $package, array $existingVersions, CompletePackageInterface $data, $flags, $rootIdentifier)
+    private function updateInformation(IOInterface $io, VersionRepository $versionRepo, Package $package, array $existingVersions, CompletePackageInterface $data, int $flags, $rootIdentifier): array
     {
         $em = $this->getEM();
         $version = new Version();
+        $versionId = null;
 
         $normVersion = $data->getVersion();
 
@@ -292,13 +298,10 @@ class Updater
                 || ($data->isDefaultBranch() !== $version->isDefaultBranch())
             ) {
                 $version = $versionRepo->find($existingVersion['id']);
-            } elseif ($existingVersion['needs_author_migration']) {
-                $version = $versionRepo->find($existingVersion['id']);
-
-                $version->setAuthorJson($version->getAuthorData());
-                $version->getAuthors()->clear();
-
-                return ['updated' => true, 'id' => $version->getId(), 'version' => strtolower($normVersion), 'object' => $version];
+                if (null === $version) {
+                    throw new \LogicException('At this point a version should always be found');
+                }
+                $versionId = $version->getId();
             } else {
                 return ['updated' => false, 'id' => $existingVersion['id'], 'version' => strtolower($normVersion), 'object' => null];
             }
@@ -400,8 +403,7 @@ class Updater
             $version->getTags()->clear();
         }
 
-        $version->getAuthors()->clear();
-        $version->setAuthorJson([]);
+        $version->setAuthors([]);
         if ($data->getAuthors()) {
             $authors = [];
             foreach ($data->getAuthors() as $authorData) {
@@ -423,16 +425,16 @@ class Updater
 
                 $authors[] = $author;
             }
-            $version->setAuthorJson($authors);
+            $version->setAuthors($authors);
         }
 
         // handle links
-        foreach ($this->supportedLinkTypes as $linkType => $opts) {
+        foreach (self::SUPPORTED_LINK_TYPES as $linkType => $opts) {
             $links = [];
             foreach ($data->{$opts['method']}() as $link) {
                 $constraint = $link->getPrettyConstraint();
                 if (false !== strpos($constraint, ',') && false !== strpos($constraint, '@')) {
-                    $constraint = preg_replace_callback('{([><]=?\s*[^@]+?)@([a-z]+)}i', function ($matches) {
+                    $constraint = Preg::replaceCallback('{([><]=?\s*[^@]+?)@([a-z]+)}i', function ($matches) {
                         if ($matches[2] === 'stable') {
                             return $matches[1];
                         }
@@ -458,7 +460,7 @@ class Updater
             foreach ($links as $linkPackageName => $linkPackageVersion) {
                 $class = 'App\Entity\\'.$opts['entity'];
                 $link = new $class;
-                $link->setPackageName($linkPackageName);
+                $link->setPackageName((string) $linkPackageName);
                 $link->setPackageVersion($linkPackageVersion);
                 $version->{'add'.$linkType.'Link'}($link);
                 $link->setVersion($version);
@@ -495,27 +497,23 @@ class Updater
             $version->getSuggest()->clear();
         }
 
-        return ['updated' => true, 'id' => $version->getId(), 'version' => strtolower($normVersion), 'object' => $version];
+        return ['updated' => true, 'id' => $versionId, 'version' => strtolower($normVersion), 'object' => $version];
     }
 
     /**
      * Update the readme for $package from $repository.
-     *
-     * @param IOInterface $io
-     * @param Package $package
-     * @param VcsRepository $repository
      */
-    private function updateReadme(IOInterface $io, Package $package, VcsRepository $repository)
+    private function updateReadme(IOInterface $io, Package $package, VcsDriverInterface $driver): void
     {
+        // GitHub readme & info handled separately in updateGitHubInfo, sweep the special attributes
         $package->setGitHubStars(null);
         $package->setGitHubWatches(null);
         $package->setGitHubForks(null);
         $package->setGitHubOpenIssues(null);
 
         try {
-            $driver = $repository->getDriver();
             $composerInfo = $driver->getComposerInformation($driver->getRootIdentifier());
-            if (isset($composerInfo['readme'])) {
+            if (isset($composerInfo['readme']) && is_string($composerInfo['readme'])) {
                 $readmeFile = $composerInfo['readme'];
             } else {
                 $readmeFile = 'README.md';
@@ -536,11 +534,17 @@ class Updater
 
                 case '.md':
                     $source = $driver->getFileContent($readmeFile, $driver->getRootIdentifier());
-                    $parser = new GithubMarkdown();
-                    $readme = $parser->parse($source);
+                    if (!empty($source)) {
+                        $parser = new GithubMarkdown();
+                        $readme = $parser->parse($source);
 
-                    if (!empty($readme)) {
-                        $package->setReadme($this->prepareReadme($readme));
+                        if (!empty($readme)) {
+                            if (Preg::isMatch('{^(?:git://|git@|https?://)(gitlab.com|bitbucket.org)[:/]([^/]+)/(.+?)(?:\.git|/)?$}i', $package->getRepository(), $match)) {
+                                $package->setReadme($this->prepareReadme($readme, $match[1], $match[2], $match[3]));
+                            } else {
+                                $package->setReadme($this->prepareReadme($readme));
+                            }
+                        }
                     }
                     break;
             }
@@ -554,14 +558,13 @@ class Updater
         }
     }
 
-    private function updateGitHubInfo(HttpDownloader $httpDownloader, Package $package, $owner, $repo, VcsRepository $repository)
+    private function updateGitHubInfo(HttpDownloader $httpDownloader, Package $package, string $owner, string $repo, VcsDriverInterface $driver): void
     {
-        $baseApiUrl = 'https://api.github.com/repos/'.$owner.'/'.$repo;
-
-        $driver = $repository->getDriver();
         if (!$driver instanceof GitHubDriver) {
             return;
         }
+
+        $baseApiUrl = 'https://api.github.com/repos/'.$owner.'/'.$repo;
 
         $repoData = $driver->getRepoData();
 
@@ -576,36 +579,32 @@ class Updater
         }
 
         if (!empty($readme)) {
-            $package->setReadme($this->prepareReadme($readme, true, $owner, $repo));
+            // The content of all readmes, regardless of file type,
+            // is returned as HTML by GitHub API
+            $package->setReadme($this->prepareReadme($readme, 'github.com', $owner, $repo));
         }
 
-        if (!empty($repoData['language'])) {
+        if (!empty($repoData['language']) && is_string($repoData['language'])) {
             $package->setLanguage($repoData['language']);
         }
-        if (isset($repoData['stargazers_count'])) {
-            $package->setGitHubStars($repoData['stargazers_count']);
+        if (isset($repoData['stargazers_count']) && is_numeric($repoData['stargazers_count'])) {
+            $package->setGitHubStars((int) $repoData['stargazers_count']);
         }
-        if (isset($repoData['subscribers_count'])) {
-            $package->setGitHubWatches($repoData['subscribers_count']);
+        if (isset($repoData['subscribers_count']) && is_numeric($repoData['subscribers_count'])) {
+            $package->setGitHubWatches((int) $repoData['subscribers_count']);
         }
-        if (isset($repoData['network_count'])) {
-            $package->setGitHubForks($repoData['network_count']);
+        if (isset($repoData['network_count']) && is_numeric($repoData['network_count'])) {
+            $package->setGitHubForks((int) $repoData['network_count']);
         }
-        if (isset($repoData['open_issues_count'])) {
-            $package->setGitHubOpenIssues($repoData['open_issues_count']);
+        if (isset($repoData['open_issues_count']) && is_numeric($repoData['open_issues_count'])) {
+            $package->setGitHubOpenIssues((int) $repoData['open_issues_count']);
         }
     }
 
     /**
      * Prepare the readme by stripping elements and attributes that are not supported .
-     *
-     * @param string $readme
-     * @param bool $isGithub
-     * @param null $owner
-     * @param null $repo
-     * @return string
      */
-    private function prepareReadme($readme, $isGithub = false, $owner = null, $repo = null)
+    private function prepareReadme(string $readme, ?string $host = null, ?string $owner = null, ?string $repo = null): string
     {
         $elements = [
             'p',
@@ -631,12 +630,14 @@ class Updater
             'img.src', 'img.title', 'img.alt', 'img.width', 'img.height', 'img.style',
             'a.href', 'a.target', 'a.rel', 'a.id',
             'td.colspan', 'td.rowspan', 'th.colspan', 'th.rowspan',
-            '*.class', 'details.open'
+            'th.align', 'td.align', 'p.align',
+            'h1.align', 'h2.align', 'h3.align', 'h4.align', 'h5.align', 'h6.align',
+            '*.class', 'details.open',
         ];
 
-        // detect base path if the github readme is located in a subfolder like docs/README.md
+        // detect base path for github readme if file is located in a subfolder like docs/README.md
         $basePath = '';
-        if ($isGithub && preg_match('{^<div id="readme" [^>]+?data-path="([^"]+)"}', $readme, $match) && false !== strpos($match[1], '/')) {
+        if ($host === 'github.com' && Preg::isMatch('{^<div id="readme" [^>]+?data-path="([^"]+)"}', $readme, $match) && false !== strpos($match[1], '/')) {
             $basePath = dirname($match[1]);
         }
         if ($basePath) {
@@ -671,23 +672,30 @@ class Updater
                 $link->setAttribute('href', '#user-content-'.substr($link->getAttribute('href'), 1));
             } elseif ('mailto:' === substr($link->getAttribute('href'), 0, 7)) {
                 // do nothing
-            } elseif ($isGithub && false === strpos($link->getAttribute('href'), '//')) {
+            } elseif ($host === 'github.com' && !str_contains($link->getAttribute('href'), '//')) {
                 $link->setAttribute(
                     'href',
                     'https://github.com/'.$owner.'/'.$repo.'/blob/HEAD/'.$basePath.$link->getAttribute('href')
                 );
+            } elseif ($host === 'gitlab.com' && !str_contains($link->getAttribute('href'), '//')) {
+                $link->setAttribute(
+                    'href',
+                    'https://gitlab.com/'.$owner.'/'.$repo.'/-/blob/HEAD/'.$basePath.$link->getAttribute('href')
+                );
             }
         }
 
-        if ($isGithub) {
-            // convert relative to absolute images
+        // embed images of selected hosts by converting relative links to accessible URLs
+        if (in_array($host, ['github.com', 'gitlab.com', 'bitbucket.org'], true)) {
             $images = $dom->getElementsByTagName('img');
             foreach ($images as $img) {
-                if (false === strpos($img->getAttribute('src'), '//')) {
-                    $img->setAttribute(
-                        'src',
-                        'https://raw.github.com/'.$owner.'/'.$repo.'/HEAD/'.$basePath.$img->getAttribute('src')
-                    );
+                if (!str_contains($img->getAttribute('src'), '//')) {
+                    $imgSrc = match ($host) {
+                        'github.com' => 'https://raw.github.com/'.$owner.'/'.$repo.'/HEAD/'.$basePath.$img->getAttribute('src'),
+                        'gitlab.com' => 'https://gitlab.com/'.$owner.'/'.$repo.'/-/raw/HEAD/'.$basePath.$img->getAttribute('src'),
+                        'bitbucket.org' => 'https://bitbucket.org/'.$owner.'/'.$repo.'/raw/HEAD/'.$basePath.$img->getAttribute('src'),
+                    };
+                    $img->setAttribute('src', $imgSrc);
                 }
             }
         }
@@ -713,11 +721,20 @@ class Updater
         return str_replace("\r\n", "\n", $readme);
     }
 
-    private function sanitize($str)
+    /**
+     * @template T of string|null
+     * @phpstan-param T $str
+     * @phpstan-return T
+     */
+    private function sanitize(string|null $str): string|null
     {
-        // remove escape chars
-        $str = preg_replace("{\x1B(?:\[.)?}u", '', $str);
+        if (null === $str) {
+            return null;
+        }
 
-        return preg_replace("{[\x01-\x1A]}u", '', $str);
+        // remove escape chars
+        $str = Preg::replace("{\x1B(?:\[.)?}u", '', $str);
+
+        return Preg::replace("{[\x01-\x1A]}u", '', $str);
     }
 }

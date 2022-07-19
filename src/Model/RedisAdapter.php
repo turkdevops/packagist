@@ -12,33 +12,27 @@
 
 namespace App\Model;
 
+use App\Entity\Package;
+use App\Entity\User;
 use Pagerfanta\Adapter\AdapterInterface;
 
 /**
  * @author Jordi Boggiano <j.boggiano@seld.be>
+ * @template-implements AdapterInterface<Package>
  */
 class RedisAdapter implements AdapterInterface
 {
-    protected $model;
-    protected $instance;
-    protected $fetchMethod;
-    protected $countMethod;
-
-    public function __construct($model, $instance, $fetchMethod, $countMethod)
+    public function __construct(private FavoriteManager $model, private User $instance)
     {
-        $this->model = $model;
-        $this->instance = $instance;
-        $this->fetchMethod = $fetchMethod;
-        $this->countMethod = $countMethod;
     }
 
     public function getNbResults(): int
     {
-        return $this->model->{$this->countMethod}($this->instance);
+        return $this->model->getFavoriteCount($this->instance);
     }
 
     public function getSlice(int $offset, int $length): iterable
     {
-        return $this->model->{$this->fetchMethod}($this->instance, $length, $offset);
+        return $this->model->getFavorites($this->instance, $length, $offset);
     }
 }

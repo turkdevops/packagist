@@ -3,28 +3,39 @@
 namespace App\SecurityAdvisory;
 
 use App\Entity\SecurityAdvisory;
+use Composer\Pcre\Preg;
+use DateTimeImmutable;
 
+/**
+ * @phpstan-type FriendsOfPhpSecurityAdvisory array{
+ *     title: string,
+ *     link: string,
+ *     reference: string,
+ *     branches: array<array{
+ *        versions: string[],
+ *        time?: int|string
+ *     }>,
+ *     cve?: string|null,
+ *     composer-repository?: false|string
+ * }
+ */
 class RemoteSecurityAdvisory
 {
-    private string $id;
-    private string $title;
-    private string $packageName;
-    private string $affectedVersions;
-    private string $link;
-    private ?string $cve;
-    private \DateTime $date;
-    private ?string $composerRepository;
-
-    public function __construct(string $id, string $title, string $packageName, string $affectedVersions, string $link, ?string $cve, \DateTime $date, ?string $composerRepository)
-    {
-        $this->id = $id;
-        $this->title = $title;
-        $this->packageName = $packageName;
-        $this->affectedVersions = $affectedVersions;
-        $this->link = $link;
-        $this->cve = $cve;
-        $this->date = $date;
-        $this->composerRepository = $composerRepository;
+    /**
+     * @param list<string> $references
+     */
+    public function __construct(
+        private string $id,
+        private string $title,
+        private string $packageName,
+        private string $affectedVersions,
+        private string $link,
+        private ?string $cve,
+        private DateTimeImmutable $date,
+        private ?string $composerRepository,
+        private array $references,
+        private string $source,
+    ) {
     }
 
     public function getId(): string
@@ -57,7 +68,7 @@ class RemoteSecurityAdvisory
         return $this->cve;
     }
 
-    public function getDate(): \DateTime
+    public function getDate(): DateTimeImmutable
     {
         return $this->date;
     }
@@ -67,24 +78,65 @@ class RemoteSecurityAdvisory
         return $this->composerRepository;
     }
 
+    /**
+     * @return list<string>
+     */
+    public function getReferences(): array
+    {
+        return $this->references;
+    }
+
+    public function getSource(): string
+    {
+        return $this->source;
+    }
+
+    public function withAddedAffectedVersion(string $version): self
+    {
+        return new self(
+            $this->getId(),
+            $this->getTitle(),
+            $this->getPackageName(),
+            implode('|', [$this->getAffectedVersions(), $version]),
+            $this->getLink(),
+            $this->getCve(),
+            $this->getDate(),
+            $this->getComposerRepository(),
+            $this->getReferences(),
+            $this->getSource(),
+        );
+    }
+
+    /**
+     * @phpstan-param FriendsOfPhpSecurityAdvisory $info
+     */
     public static function createFromFriendsOfPhp(string $fileNameWithPath, array $info): RemoteSecurityAdvisory
     {
         $date = null;
         $fallbackYearDate = null;
-        if (preg_match('#(\d{4}-\d{2}-\d{2})#', basename($fileNameWithPath), $matches)) {
-            $date = new \DateTime($matches[1] . ' 00:00:00');
-        } elseif (preg_match('#CVE-(2\d{3})-\d#', basename($fileNameWithPath), $matches)) {
-            $fallbackYearDate = new \DateTime($matches[1] . '-01-01 00:00:00');
+        if (Preg::isMatch('#(\d{4}-\d{2}-\d{2})#', basename($fileNameWithPath), $matches)) {
+            $date = new DateTimeImmutable($matches[1] . ' 00:00:00');
+        } elseif (Preg::isMatch('#CVE-(2\d{3})-\d#', basename($fileNameWithPath), $matches)) {
+            $fallbackYearDate = new DateTimeImmutable($matches[1] . '-01-01 00:00:00');
         }
 
         $affectedVersions = [];
         $lowestBranchDate = null;
         foreach ($info['branches'] as $branchInfo) {
             $affectedVersions[] = implode(',', $branchInfo['versions']);
-            if (!$date && isset($branchInfo['time']) && is_int($branchInfo['time'])) {
-                $branchDate = new \DateTime('@' . $branchInfo['time']);
-                if (!$lowestBranchDate || $branchDate < $lowestBranchDate) {
-                    $lowestBranchDate = $branchDate;
+            if (!$date && isset($branchInfo['time'])) {
+                $timestamp = null;
+                if (is_int($branchInfo['time'])) {
+                    $timestamp = $branchInfo['time'];
+                } elseif (is_string($branchInfo['time'])) {
+                    $timestamp = strtotime($branchInfo['time']);
+                }
+
+                if ($timestamp) {
+                    $branchDate = new DateTimeImmutable('@' . $timestamp);
+                    if (!$lowestBranchDate || $branchDate < $lowestBranchDate) {
+                        $lowestBranchDate = $branchDate;
+                    }
                 }
             }
         }
@@ -95,7 +147,7 @@ class RemoteSecurityAdvisory
             } elseif ($fallbackYearDate) {
                 $date = $fallbackYearDate;
             } else {
-                $date = (new \DateTime())->setTime(0, 0, 0);
+                $date = (new \DateTimeImmutable())->setTime(0, 0, 0);
             }
         }
 
@@ -109,15 +161,22 @@ class RemoteSecurityAdvisory
             }
         }
 
+        $cve = null;
+        if (isset($info['cve']) && AdvisoryParser::isValidCve((string) $info['cve'])) {
+            $cve = $info['cve'];
+        }
+
         return new RemoteSecurityAdvisory(
             $fileNameWithPath,
             $info['title'],
             str_replace('composer://', '', $info['reference']),
             implode('|', $affectedVersions),
             $info['link'],
-            $info['cve'] ?? null,
+            $cve,
             $date,
-            $composerRepository
+            $composerRepository,
+            [],
+            FriendsOfPhpSecurityAdvisoriesSource::SOURCE_NAME
         );
     }
 }

@@ -15,15 +15,20 @@ namespace App\Model;
 use Algolia\AlgoliaSearch\Exceptions\AlgoliaException;
 use App\Entity\Dependent;
 use App\Entity\PhpStat;
+use App\Entity\User;
 use Doctrine\Persistence\ManagerRegistry;
 use App\Entity\Package;
 use App\Entity\Version;
 use App\Entity\Download;
 use App\Entity\EmptyReferenceCache;
 use Psr\Log\LoggerInterface;
+use Composer\Pcre\Preg;
 use Algolia\AlgoliaSearch\SearchClient;
 use Predis\Client;
 use App\Service\GitHubUserMigrationWorker;
+use Symfony\Contracts\HttpClient\Exception\DecodingExceptionInterface;
+use Symfony\Contracts\HttpClient\Exception\HttpExceptionInterface;
+use Symfony\Contracts\HttpClient\Exception\TransportExceptionInterface;
 use Twig\Environment;
 use Symfony\Component\Mailer\MailerInterface;
 use Symfony\Component\Mime\Address;
@@ -34,34 +39,24 @@ use Symfony\Component\Mime\Email;
  */
 class PackageManager
 {
-    private ManagerRegistry $doctrine;
-    private MailerInterface $mailer;
-    private Environment $twig;
-    private LoggerInterface $logger;
-    private array $options;
-    private ProviderManager $providerManager;
-    private SearchClient $algoliaClient;
-    private string $algoliaIndexName;
-    private GitHubUserMigrationWorker $githubWorker;
-    private string $metadataDir;
-    private Client $redis;
-
-    public function __construct(ManagerRegistry $doctrine, MailerInterface $mailer, Environment $twig, LoggerInterface $logger, array $options, ProviderManager $providerManager, SearchClient $algoliaClient, string $algoliaIndexName, GitHubUserMigrationWorker $githubWorker, string $metadataDir, Client $redis, private VersionIdCache $versionIdCache)
-    {
-        $this->doctrine = $doctrine;
-        $this->mailer = $mailer;
-        $this->twig = $twig;
-        $this->logger = $logger;
-        $this->options = $options;
-        $this->providerManager = $providerManager;
-        $this->algoliaClient = $algoliaClient;
-        $this->algoliaIndexName  = $algoliaIndexName;
-        $this->githubWorker  = $githubWorker;
-        $this->metadataDir  = $metadataDir;
-        $this->redis = $redis;
+    public function __construct(
+        private ManagerRegistry $doctrine,
+        private MailerInterface $mailer,
+        private Environment $twig,
+        private LoggerInterface $logger,
+        /** @var array{from: string, fromName: string} */
+        private array $options,
+        private ProviderManager $providerManager,
+        private SearchClient $algoliaClient,
+        private string $algoliaIndexName,
+        private GitHubUserMigrationWorker $githubWorker,
+        private string $metadataDir,
+        private Client $redis,
+        private VersionIdCache $versionIdCache,
+    ) {
     }
 
-    public function deletePackage(Package $package)
+    public function deletePackage(Package $package): void
     {
         $versionRepo = $this->doctrine->getRepository(Version::class);
         foreach ($package->getVersions() as $version) {
@@ -75,7 +70,7 @@ class PackageManager
                     if ($token && $this->githubWorker->deleteWebHook($token, $package)) {
                         break;
                     }
-                } catch (\GuzzleHttp\Exception\TransferException $e) {
+                } catch (TransportExceptionInterface | DecodingExceptionInterface | HttpExceptionInterface $e) {
                     // ignore
                 }
             }
@@ -140,22 +135,28 @@ class PackageManager
         }
     }
 
-    public function notifyUpdateFailure(Package $package, \Exception $e, $details = null)
+    public function notifyUpdateFailure(Package $package, \Exception $e, string $details = null): bool
     {
         if (!$package->isUpdateFailureNotified()) {
             $recipients = [];
             foreach ($package->getMaintainers() as $maintainer) {
-                if ($maintainer->isNotifiableForFailures()) {
-                    $recipients[$maintainer->getEmail()] = new Address($maintainer->getEmail(), $maintainer->getUsername());
+                $mail = $maintainer->getEmail();
+                if ($mail && $maintainer->isNotifiableForFailures()) {
+                    $recipients[$mail] = new Address($mail, $maintainer->getUsername());
                 }
             }
 
             if ($recipients) {
+                $details = strip_tags($details ?? '');
+                $details = Preg::replace('{(?<=\n|^)Found cached composer\.json .*\n}', '', $details);
+                $details = Preg::replace('{(?<=\n|^)Reading composer\.json .*\n}', '', $details);
+                $details = Preg::replace('{(?<=\n|^)Importing (tag|branch) .*\n}', '', $details);
+
                 $body = $this->twig->render('email/update_failed.txt.twig', [
                     'package' => $package,
                     'exception' => get_class($e),
                     'exceptionMessage' => $e->getMessage(),
-                    'details' => strip_tags($details),
+                    'details' => $details,
                 ]);
 
                 $message = (new Email())
@@ -188,7 +189,7 @@ class PackageManager
         return true;
     }
 
-    public function notifyNewMaintainer($user, $package)
+    public function notifyNewMaintainer(User $user, Package $package): bool
     {
         $body = $this->twig->render('email/maintainer_added.txt.twig', [
             'package_name' => $package->getName()
@@ -197,7 +198,7 @@ class PackageManager
         $message = (new Email)
             ->subject('You have been added to ' . $package->getName() . ' as a maintainer')
             ->from(new Address($this->options['from'], $this->options['fromName']))
-            ->to($user->getEmail())
+            ->to((string) $user->getEmail())
             ->text($body)
         ;
 

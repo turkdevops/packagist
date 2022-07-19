@@ -18,9 +18,15 @@ use App\Validator\Copyright;
 use Composer\Downloader\TransportException;
 use Composer\Factory;
 use Composer\IO\NullIO;
+use Composer\Pcre\Preg;
 use Composer\Repository\VcsRepository;
 use Doctrine\Common\Collections\ArrayCollection;
+use Doctrine\Common\Collections\Collection;
+use Doctrine\Common\Collections\Selectable;
 use Doctrine\ORM\Mapping as ORM;
+use Symfony\Component\Routing\Generator\UrlGeneratorInterface;
+use Symfony\Component\Routing\RouterInterface;
+use Symfony\Component\Security\Core\User\UserInterface;
 use Symfony\Component\Validator\Constraints as Assert;
 use Symfony\Component\Validator\Context\ExecutionContextInterface;
 use Composer\Repository\Vcs\GitHubDriver;
@@ -38,7 +44,8 @@ use DateTimeInterface;
  *         @ORM\Index(name="dumped_idx",columns={"dumpedAt"}),
  *         @ORM\Index(name="dumped2_idx",columns={"dumpedAtV2"}),
  *         @ORM\Index(name="repository_idx",columns={"repository"}),
- *         @ORM\Index(name="remoteid_idx",columns={"remoteId"})
+ *         @ORM\Index(name="remoteid_idx",columns={"remoteId"}),
+ *         @ORM\Index(name="dumped2_crawled_idx",columns={"dumpedAtV2","crawledAt"})
  *     }
  * )
  * @Assert\Callback(callback="isPackageUnique", groups={"Create"})
@@ -50,6 +57,7 @@ use DateTimeInterface;
  */
 class Package
 {
+    const AUTO_NONE = 0;
     const AUTO_MANUAL_HOOK = 1;
     const AUTO_GITHUB_HOOK = 2;
 
@@ -58,7 +66,7 @@ class Package
      * @ORM\Column(type="integer")
      * @ORM\GeneratedValue(strategy="AUTO")
      */
-    private $id;
+    private int $id;
 
     /**
      * Unique package name
@@ -70,61 +78,61 @@ class Package
     /**
      * @ORM\Column(nullable=true)
      */
-    private $type;
+    private string|null $type = null;
 
     /**
      * @ORM\Column(type="text", nullable=true)
      */
-    private $description;
+    private string|null $description = null;
 
     /**
      * @ORM\Column(type="string", nullable=true)
      */
-    private $language;
+    private string|null $language = null;
 
     /**
      * @ORM\Column(type="text", nullable=true)
      */
-    private $readme;
+    private string|null $readme = null;
 
     /**
      * @ORM\Column(type="integer", nullable=true, name="github_stars")
      */
-    private $gitHubStars;
+    private int|null $gitHubStars = null;
 
     /**
      * @ORM\Column(type="integer", nullable=true, name="github_watches")
      */
-    private $gitHubWatches;
+    private int|null $gitHubWatches = null;
 
     /**
      * @ORM\Column(type="integer", nullable=true, name="github_forks")
      */
-    private $gitHubForks;
+    private int|null $gitHubForks = null;
 
     /**
      * @ORM\Column(type="integer", nullable=true, name="github_open_issues")
      */
-    private $gitHubOpenIssues;
+    private int|null $gitHubOpenIssues = null;
 
     /**
      * @ORM\OneToMany(targetEntity="App\Entity\Version", mappedBy="package")
+     * @var Collection<int, Version>&Selectable<int, Version>
      */
-    private $versions;
+    private Collection $versions;
 
     /**
      * @ORM\ManyToMany(targetEntity="User", inversedBy="packages")
      * @ORM\JoinTable(name="maintainers_packages")
+     * @var Collection<int, User>&Selectable<int, User>
      */
-    private $maintainers;
+    private Collection $maintainers;
 
     /**
      * @ORM\Column()
      * @Assert\NotBlank(groups={"Update", "Default"})
      */
-    private $repository;
-
-    // dist-tags / rel or runtime?
+    private string $repository;
 
     /**
      * @ORM\Column(type="datetime")
@@ -134,63 +142,67 @@ class Package
     /**
      * @ORM\Column(type="datetime", nullable=true)
      */
-    private ?DateTimeInterface $updatedAt = null;
+    private DateTimeInterface|null $updatedAt = null;
 
     /**
      * @ORM\Column(type="datetime", nullable=true)
      */
-    private ?DateTimeInterface $crawledAt = null;
+    private DateTimeInterface|null $crawledAt = null;
 
     /**
      * @ORM\Column(type="datetime", nullable=true)
      */
-    private ?DateTimeInterface $indexedAt = null;
+    private DateTimeInterface|null $indexedAt = null;
 
     /**
      * @ORM\Column(type="datetime", nullable=true)
      */
-    private ?DateTimeInterface $dumpedAt = null;
+    private DateTimeInterface|null $dumpedAt = null;
 
     /**
      * @ORM\Column(type="datetime", nullable=true)
      */
-    private ?DateTimeInterface $dumpedAtV2 = null;
+    private DateTimeInterface|null $dumpedAtV2 = null;
 
     /**
      * @ORM\OneToMany(targetEntity="App\Entity\Download", mappedBy="package")
+     * @var Collection<int, Download>&Selectable<int, Download>
      */
-    private $downloads;
+    private Collection $downloads;
 
     /**
      * @ORM\Column(type="string", nullable=true)
      */
-    private $remoteId;
+    private string|null $remoteId = null;
 
     /**
      * @ORM\Column(type="smallint")
+     * @var int one of self::AUTO_*
      */
-    private $autoUpdated = 0;
+    private int $autoUpdated = 0;
 
     /**
      * @var bool
      * @ORM\Column(type="boolean")
      */
-    private $abandoned = false;
+    private bool $abandoned = false;
 
     /**
      * @ORM\Column(type="string", length=255, nullable=true)
      */
-    private ?string $replacementPackage = null;
+    private string|null $replacementPackage = null;
 
     /**
      * @ORM\Column(type="boolean", options={"default"=false})
      */
-    private $updateFailureNotified = false;
+    private bool $updateFailureNotified = false;
 
     /**
+     * If set, the content is the reason for being marked suspicious
+     *
      * @ORM\Column(type="string", length=255, nullable=true)
      */
-    private $suspect;
+    private string|null $suspect = null;
 
     private $entityRepository;
     private $router;
@@ -209,10 +221,12 @@ class Package
     public function __construct()
     {
         $this->versions = new ArrayCollection();
+        $this->maintainers = new ArrayCollection();
+        $this->downloads = new ArrayCollection();
         $this->createdAt = new \DateTime;
     }
 
-    public function toArray(VersionRepository $versionRepo, bool $serializeForApi = false)
+    public function toArray(VersionRepository $versionRepo, bool $serializeForApi = false): array
     {
         $maintainers = [];
         foreach ($this->getMaintainers() as $maintainer) {
@@ -252,7 +266,7 @@ class Package
         return $data;
     }
 
-    public function isRepositoryValid(ExecutionContextInterface $context)
+    public function isRepositoryValid(ExecutionContextInterface $context): void
     {
         // vcs driver was not nulled which means the repository was not set/modified and is still valid
         if (true === $this->vcsDriver && '' !== $this->name) {
@@ -262,12 +276,12 @@ class Package
         $property = 'repository';
         $driver = $this->vcsDriver;
         if (!is_object($driver)) {
-            if (preg_match('{^http://}', $this->repository)) {
+            if (Preg::isMatch('{^http://}', $this->repository)) {
                 $context->buildViolation('Non-secure HTTP URLs are not supported, make sure you use an HTTPS or SSH URL')
                     ->atPath($property)
                     ->addViolation()
                 ;
-            } elseif (preg_match('{https?://.+@}', $this->repository)) {
+            } elseif (Preg::isMatch('{https?://.+@}', $this->repository)) {
                 $context->buildViolation('URLs with user@host are not supported, use a read-only public URL')
                     ->atPath($property)
                     ->addViolation()
@@ -287,7 +301,7 @@ class Package
         }
         try {
             $information = $driver->getComposerInformation($driver->getRootIdentifier());
-            if (empty($information['name'])) {
+            if (empty($information['name']) || !is_string($information['name'])) {
                 $context->buildViolation('The package name was not found in the composer.json, make sure there is a name present.')
                     ->atPath($property)
                     ->addViolation()
@@ -295,7 +309,7 @@ class Package
                 return;
             }
 
-            if (!preg_match('{^[a-z0-9]([_.-]?[a-z0-9]+)*/[a-z0-9]([_.-]?[a-z0-9]+)*$}iD', $information['name'])) {
+            if (!Preg::isMatch('{^[a-z0-9]([_.-]?[a-z0-9]+)*/[a-z0-9]([_.-]?[a-z0-9]+)*$}iD', $information['name'])) {
                 $context->buildViolation('The package name '.htmlentities($information['name'], ENT_COMPAT, 'utf-8').' is invalid, it should have a vendor name, a forward slash, and a package name. The vendor and package name can be words separated by -, . or _. The complete name should match "[a-z0-9]([_.-]?[a-z0-9]+)*/[a-z0-9]([_.-]?[a-z0-9]+)*".')
                     ->atPath($property)
                     ->addViolation()
@@ -304,10 +318,21 @@ class Package
             }
 
             if (
-                preg_match('{(free.*watch|watch.*free|(stream|online).*anschauver.*pelicula|ver.*completa|pelicula.*complet|season.*episode.*online|film.*(complet|entier)|(voir|regarder|guarda|assistir).*(film|complet)|full.*movie|online.*(free|tv|full.*hd)|(free|full|gratuit).*stream|movie.*free|free.*(movie|hack)|watch.*movie|watch.*full|generate.*resource|generate.*unlimited|hack.*coin|coin.*(hack|generat)|vbucks|hack.*cheat|hack.*generat|generat.*hack|hack.*unlimited|cheat.*(unlimited|generat)|(mod|cheat|apk).*(hack|cheat|mod)|hack.*(apk|mod|free|gold|gems|diamonds|coin)|putlocker|generat.*free|coins.*generat|(download|telecharg).*album|album.*(download|telecharg)|album.*(free|gratuit)|generat.*coins|unlimited.*coins|(fortnite|pubg|apex.*legend|t[1i]k.*t[o0]k).*(free|gratuit|generat|unlimited|coins|mobile|hack|follow))}i', str_replace(['.', '-'], '', $information['name']))
-                && !preg_match('{^(hexmode|calgamo|liberty_code(_module)?|dvi|thelia|clayfreeman|watchfulli|assaneonline|awema-pl|magemodules?|simplepleb|modullo|modernmt|modina|havefnubb|lucid-modules|cointavia|magento-hackathon)/}', $information['name'])
+                Preg::isMatch('{(free.*watch|watch.*free|(stream|online).*anschauver.*pelicula|ver.*completa|pelicula.*complet|season.*episode.*online|film.*(complet|entier)|(voir|regarder|guarda|assistir).*(film|complet)|full.*movie|online.*(free|tv|full.*hd)|(free|full|gratuit).*stream|movie.*free|free.*(movie|hack)|watch.*movie|watch.*full|generate.*resource|generate.*unlimited|hack.*coin|coin.*(hack|generat)|vbucks|hack.*cheat|hack.*generat|generat.*hack|hack.*unlimited|cheat.*(unlimited|generat)|(mod(?!ule)|cheat|apk).*(hack|cheat|mod(?!ule))|hack.*(apk|mod(?!ule)|free|gold|gems|diamonds|coin)|putlocker|generat.*free|coins.*generat|(download|telecharg).*album|album.*(download|telecharg)|album.*(free|gratuit)|generat.*coins|unlimited.*coins|(fortnite|pubg|apex.*legend|t[1i]k.*t[o0]k).*(free|gratuit|generat|unlimited|coins|mobile|hack|follow))}i', str_replace(['.', '-'], '', $information['name']))
+                && !Preg::isMatch('{^(hexmode|calgamo|liberty_code(_module)?|dvi|thelia|clayfreeman|watchfulli|assaneonline|awema-pl|magemodules?|simplepleb|modullo|modernmt|modina|havefnubb|lucid-modules|cointavia|magento-hackathon|pragmatic-modules|pmpr|moderntribe|teamneusta|modelfox|yii2-module)/}', $information['name'])
             ) {
                 $context->buildViolation('The package name '.htmlentities($information['name'], ENT_COMPAT, 'utf-8').' is blocked, if you think this is a mistake please get in touch with us.')
+                    ->atPath($property)
+                    ->addViolation()
+                ;
+                return;
+            }
+
+            if (
+                Preg::isMatch('{^([^/]*(symfony)[^/]*)/}', $information['name'], $match)
+                && !$this->entityRepository->isVendorTaken($match[1])
+            ) {
+                $context->buildViolation('The vendor name '.htmlentities($match[1], ENT_COMPAT, 'utf-8').' is blocked, if you think this is a mistake please get in touch with us.')
                     ->atPath($property)
                     ->addViolation()
                 ;
@@ -334,7 +359,7 @@ class Package
                 return;
             }
 
-            if (preg_match('{\.json$}', $information['name'])) {
+            if (Preg::isMatch('{\.json$}', $information['name'])) {
                 $context->buildViolation('The package name '.htmlentities($information['name'], ENT_COMPAT, 'utf-8').' is invalid, package names can not end in .json, consider renaming it or perhaps using a -json suffix instead.')
                     ->atPath($property)
                     ->addViolation()
@@ -342,8 +367,8 @@ class Package
                 return;
             }
 
-            if (preg_match('{[A-Z]}', $information['name'])) {
-                $suggestName = preg_replace('{(?:([a-z])([A-Z])|([A-Z])([A-Z][a-z]))}', '\\1\\3-\\2\\4', $information['name']);
+            if (Preg::isMatch('{[A-Z]}', $information['name'])) {
+                $suggestName = Preg::replace('{(?:([a-z])([A-Z])|([A-Z])([A-Z][a-z]))}', '\\1\\3-\\2\\4', $information['name']);
                 $suggestName = strtolower($suggestName);
 
                 $context->buildViolation('The package name '.htmlentities($information['name'], ENT_COMPAT, 'utf-8').' is invalid, it should not contain uppercase characters. We suggest using '.$suggestName.' instead.')
@@ -376,17 +401,17 @@ class Package
         }
     }
 
-    public function setEntityRepository($repository)
+    public function setEntityRepository(PackageRepository $repository): void
     {
         $this->entityRepository = $repository;
     }
 
-    public function setRouter($router)
+    public function setRouter(UrlGeneratorInterface $router): void
     {
         $this->router = $router;
     }
 
-    public function isPackageUnique(ExecutionContextInterface $context)
+    public function isPackageUnique(ExecutionContextInterface $context): void
     {
         try {
             if ($this->entityRepository->findOneByName($this->name)) {
@@ -398,11 +423,11 @@ class Package
         } catch (\Doctrine\ORM\NoResultException $e) {}
     }
 
-    public function isVendorWritable(ExecutionContextInterface $context)
+    public function isVendorWritable(ExecutionContextInterface $context): void
     {
         try {
             $vendor = $this->getVendor();
-            if ($vendor && $this->entityRepository->isVendorTaken($vendor, reset($this->maintainers))) {
+            if ($vendor && $this->entityRepository->isVendorTaken($vendor, $this->maintainers->first() ?: null)) {
                 $context->buildViolation('The vendor name "'.$vendor.'" was already claimed by someone else on Packagist.org. '
                         . 'You may ask them to add your package and give you maintainership access. '
                         . 'If they add you as a maintainer on any package in that vendor namespace, '
@@ -422,7 +447,7 @@ class Package
         return $this->id;
     }
 
-    public function setName(string $name)
+    public function setName(string $name): void
     {
         $this->name = $name;
     }
@@ -438,154 +463,98 @@ class Package
 
     /**
      * Get vendor prefix
-     *
-     * @return string
      */
-    public function getVendor()
+    public function getVendor(): string
     {
-        return preg_replace('{/.*$}', '', $this->name);
+        return Preg::replace('{/.*$}', '', $this->name);
     }
 
     /**
      * Get package name without vendor
-     *
-     * @return string
      */
-    public function getPackageName()
+    public function getPackageName(): string
     {
-        return preg_replace('{^[^/]*/}', '', $this->name);
+        return Preg::replace('{^[^/]*/}', '', $this->name);
     }
 
-    /**
-     * Set description
-     *
-     * @param string $description
-     */
-    public function setDescription($description)
+    public function setDescription(string|null $description): void
     {
         $this->description = $description;
     }
 
-    /**
-     * Get description
-     *
-     * @return string
-     */
-    public function getDescription()
+    public function getDescription(): string|null
     {
         return $this->description;
     }
 
-    /**
-     * Set language
-     *
-     * @param string $language
-     */
-    public function setLanguage($language)
+    public function setLanguage(string $language): void
     {
         $this->language = $language;
     }
 
-    /**
-     * Get language
-     *
-     * @return string
-     */
-    public function getLanguage()
+    public function getLanguage(): string|null
     {
         return $this->language;
     }
 
-    /**
-     * Set readme
-     *
-     * @param string $readme
-     */
-    public function setReadme($readme)
+    public function setReadme(string $readme): void
     {
         $this->readme = $readme;
     }
 
-    /**
-     * Get readme
-     *
-     * @return string
-     */
-    public function getReadme()
+    public function getReadme(): string
     {
-        return $this->readme;
+        return (string) $this->readme;
     }
 
     /**
      * Get readme with transformations that should not be done in the stored readme as they might not be valid in the long run
-     *
-     * @return string
      */
-    public function getOptimizedReadme()
+    public function getOptimizedReadme(): string
     {
+        if ($this->readme === null) {
+            return '';
+        }
+
         return str_replace(['<img src="https://raw.github.com/', '<img src="https://raw.githubusercontent.com/'], '<img src="https://rawcdn.githack.com/', $this->readme);
     }
 
-    /**
-     * @param int $val
-     */
-    public function setGitHubStars($val)
+    public function setGitHubStars(int|null $val): void
     {
         $this->gitHubStars = $val;
     }
 
-    /**
-     * @return int
-     */
-    public function getGitHubStars()
+    public function getGitHubStars(): int|null
     {
         return $this->gitHubStars;
     }
 
-    /**
-     * @param int $val
-     */
-    public function setGitHubWatches($val)
+    public function setGitHubWatches(int|null $val): void
     {
         $this->gitHubWatches = $val;
     }
 
-    /**
-     * @return int
-     */
-    public function getGitHubWatches()
+    public function getGitHubWatches(): int|null
     {
         return $this->gitHubWatches;
     }
 
-    /**
-     * @param int $val
-     */
-    public function setGitHubForks($val)
+    public function setGitHubForks(int|null $val): void
     {
         $this->gitHubForks = $val;
     }
 
-    /**
-     * @return int
-     */
-    public function getGitHubForks()
+    public function getGitHubForks(): int|null
     {
         return $this->gitHubForks;
     }
 
-    /**
-     * @param int $val
-     */
-    public function setGitHubOpenIssues($val)
+    public function setGitHubOpenIssues(int|null $val): void
     {
         $this->gitHubOpenIssues = $val;
     }
 
-    /**
-     * @return int
-     */
-    public function getGitHubOpenIssues()
+    public function getGitHubOpenIssues(): int|null
     {
         return $this->gitHubOpenIssues;
     }
@@ -605,35 +574,35 @@ class Package
         $this->vcsDriver = null;
 
         // prevent local filesystem URLs
-        if (preg_match('{^(\.|[a-z]:|/)}i', $repoUrl)) {
+        if (Preg::isMatch('{^(\.|[a-z]:|/)}i', $repoUrl)) {
             return;
         }
 
-        $repoUrl = preg_replace('{^git@github.com:}i', 'https://github.com/', $repoUrl);
-        $repoUrl = preg_replace('{^git://github.com/}i', 'https://github.com/', $repoUrl);
-        $repoUrl = preg_replace('{^(https://github.com/.*?)\.git$}i', '$1', $repoUrl);
+        $repoUrl = Preg::replace('{^git@github.com:}i', 'https://github.com/', $repoUrl);
+        $repoUrl = Preg::replace('{^git://github.com/}i', 'https://github.com/', $repoUrl);
+        $repoUrl = Preg::replace('{^(https://github.com/.*?)\.git$}i', '$1', $repoUrl);
 
-        $repoUrl = preg_replace('{^git@gitlab.com:}i', 'https://gitlab.com/', $repoUrl);
-        $repoUrl = preg_replace('{^(https://gitlab.com/.*?)\.git$}i', '$1', $repoUrl);
+        $repoUrl = Preg::replace('{^git@gitlab.com:}i', 'https://gitlab.com/', $repoUrl);
+        $repoUrl = Preg::replace('{^(https://gitlab.com/.*?)\.git$}i', '$1', $repoUrl);
 
-        $repoUrl = preg_replace('{^git@+bitbucket.org:}i', 'https://bitbucket.org/', $repoUrl);
-        $repoUrl = preg_replace('{^bitbucket.org:}i', 'https://bitbucket.org/', $repoUrl);
-        $repoUrl = preg_replace('{^https://[a-z0-9_-]*@bitbucket.org/}i', 'https://bitbucket.org/', $repoUrl);
-        $repoUrl = preg_replace('{^(https://bitbucket.org/[^/]+/[^/]+)/src/[^.]+}i', '$1.git', $repoUrl);
+        $repoUrl = Preg::replace('{^git@+bitbucket.org:}i', 'https://bitbucket.org/', $repoUrl);
+        $repoUrl = Preg::replace('{^bitbucket.org:}i', 'https://bitbucket.org/', $repoUrl);
+        $repoUrl = Preg::replace('{^https://[a-z0-9_-]*@bitbucket.org/}i', 'https://bitbucket.org/', $repoUrl);
+        $repoUrl = Preg::replace('{^(https://bitbucket.org/[^/]+/[^/]+)/src/[^.]+}i', '$1.git', $repoUrl);
 
         // normalize protocol case
-        $repoUrl = preg_replace_callback('{^(https?|git|svn)://}i', function ($match) { return strtolower($match[1]) . '://'; }, $repoUrl);
+        $repoUrl = Preg::replaceCallback('{^(https?|git|svn)://}i', fn ($match) => strtolower($match[1]) . '://', $repoUrl);
 
         $this->repository = $repoUrl;
         $this->remoteId = null;
 
         // avoid user@host URLs
-        if (preg_match('{https?://.+@}', $repoUrl)) {
+        if (Preg::isMatch('{https?://.+@}', $repoUrl)) {
             return;
         }
 
         // validate that this is a somewhat valid URL
-        if (!preg_match('{^([a-z0-9][^@\s]+@[a-z0-9-_.]+:\S+ | [a-z0-9]+://\S+)$}Dx', $repoUrl)) {
+        if (!Preg::isMatch('{^([a-z0-9][^@\s]+@[a-z0-9-_.]+:\S+ | [a-z0-9]+://\S+)$}Dx', $repoUrl)) {
             return;
         }
 
@@ -649,7 +618,7 @@ class Package
                 return;
             }
             $information = $driver->getComposerInformation($driver->getRootIdentifier());
-            if (!isset($information['name'])) {
+            if (!isset($information['name']) || !is_string($information['name'])) {
                 return;
             }
             if ('' === $this->name) {
@@ -671,7 +640,7 @@ class Package
      *
      * @return string $repository
      */
-    public function getRepository()
+    public function getRepository(): string
     {
         return $this->repository;
     }
@@ -681,36 +650,29 @@ class Package
      *
      * @return string $repository
      */
-    public function getBrowsableRepository()
+    public function getBrowsableRepository(): string
     {
-        if (preg_match('{(://|@)bitbucket.org[:/]}i', $this->repository)) {
-            return preg_replace('{^(?:git@|https://|git://)bitbucket.org[:/](.+?)(?:\.git)?$}i', 'https://bitbucket.org/$1', $this->repository);
+        if (Preg::isMatch('{(://|@)bitbucket.org[:/]}i', $this->repository)) {
+            return Preg::replace('{^(?:git@|https://|git://)bitbucket.org[:/](.+?)(?:\.git)?$}i', 'https://bitbucket.org/$1', $this->repository);
         }
 
-        return preg_replace('{^(git://github.com/|git@github.com:)}', 'https://github.com/', $this->repository);
+        return Preg::replace('{^(git://github.com/|git@github.com:)}', 'https://github.com/', $this->repository);
     }
 
-    /**
-     * Add versions
-     *
-     * @param Version $versions
-     */
-    public function addVersions(Version $versions)
+    public function addVersion(Version $version): void
     {
-        $this->versions[] = $versions;
+        $this->versions[] = $version;
     }
 
     /**
-     * Get versions
-     *
-     * @return ArrayCollection<Version>
+     * @return Collection<int, Version>&Selectable<int, Version>
      */
-    public function getVersions()
+    public function getVersions(): Collection
     {
         return $this->versions;
     }
 
-    public function getVersion($normalizedVersion)
+    public function getVersion(string $normalizedVersion): Version|null
     {
         if (null === $this->cachedVersions) {
             $this->cachedVersions = [];
@@ -726,7 +688,7 @@ class Package
         return null;
     }
 
-    public function setUpdatedAt(DateTimeInterface $updatedAt)
+    public function setUpdatedAt(DateTimeInterface $updatedAt): void
     {
         $this->updatedAt = $updatedAt;
         $this->setUpdateFailureNotified(false);
@@ -782,73 +744,62 @@ class Package
         return $this->dumpedAtV2;
     }
 
-    /**
-     * Add maintainers
-     *
-     * @param User $maintainer
-     */
-    public function addMaintainer(User $maintainer)
+    public function addMaintainer(User $maintainer): void
     {
         $this->maintainers[] = $maintainer;
     }
 
     /**
-     * Get maintainers
-     *
-     * @return ArrayCollection<User>
+     * @return Collection<int, User>&Selectable<int, User>
      */
-    public function getMaintainers()
+    public function getMaintainers(): Collection
     {
         return $this->maintainers;
     }
 
-    /**
-     * Set type
-     *
-     * @param string $type
-     */
-    public function setType($type)
+    public function isMaintainer(?User $user): bool
+    {
+        if (null === $user) {
+            return false;
+        }
+
+        return $this->maintainers->contains($user);
+    }
+
+    public function setType(string $type): void
     {
         $this->type = $type;
     }
 
-    /**
-     * Get type
-     *
-     * @return string
-     */
-    public function getType()
+    public function getType(): string|null
     {
         return $this->type;
     }
 
-    public function setRemoteId(?string $remoteId)
+    public function setRemoteId(string|null $remoteId): void
     {
         $this->remoteId = $remoteId;
     }
 
-    public function getRemoteId(): ?string
+    public function getRemoteId(): string|null
     {
         return $this->remoteId;
     }
 
     /**
-     * Set autoUpdated
-     *
-     * @param int $autoUpdated
+     * @param self::AUTO_* $autoUpdated
      */
-    public function setAutoUpdated($autoUpdated)
+    public function setAutoUpdated(int $autoUpdated): void
     {
         $this->autoUpdated = $autoUpdated;
     }
 
     /**
-     * Get autoUpdated
-     *
-     * @return int
+     * @return self::AUTO_*
      */
-    public function getAutoUpdated()
+    public function getAutoUpdated(): int
     {
+        assert(in_array($this->autoUpdated, [self::AUTO_NONE, self::AUTO_MANUAL_HOOK, self::AUTO_GITHUB_HOOK], true));
         return $this->autoUpdated;
     }
 
@@ -857,7 +808,7 @@ class Package
      *
      * @return Boolean
      */
-    public function isAutoUpdated()
+    public function isAutoUpdated(): bool
     {
         return $this->autoUpdated > 0;
     }
@@ -867,7 +818,7 @@ class Package
      *
      * @param Boolean $updateFailureNotified
      */
-    public function setUpdateFailureNotified($updateFailureNotified)
+    public function setUpdateFailureNotified($updateFailureNotified): void
     {
         $this->updateFailureNotified = $updateFailureNotified;
     }
@@ -877,12 +828,12 @@ class Package
      *
      * @return Boolean
      */
-    public function isUpdateFailureNotified()
+    public function isUpdateFailureNotified(): bool
     {
         return $this->updateFailureNotified;
     }
 
-    public function setSuspect(?string $reason)
+    public function setSuspect(?string $reason): void
     {
         $this->suspect = $reason;
     }
@@ -900,7 +851,7 @@ class Package
     /**
      * @return boolean
      */
-    public function isAbandoned()
+    public function isAbandoned(): bool
     {
         return $this->abandoned;
     }
@@ -908,7 +859,7 @@ class Package
     /**
      * @param boolean $abandoned
      */
-    public function setAbandoned($abandoned)
+    public function setAbandoned($abandoned): void
     {
         $this->abandoned = $abandoned;
     }
@@ -918,26 +869,26 @@ class Package
         return $this->replacementPackage;
     }
 
-    public function setReplacementPackage(?string $replacementPackage)
+    public function setReplacementPackage(?string $replacementPackage): void
     {
         $this->replacementPackage = $replacementPackage;
     }
 
-    public static function sortVersions($a, $b)
+    public static function sortVersions(Version $a, Version $b): int
     {
         $aVersion = $a->getNormalizedVersion();
         $bVersion = $b->getNormalizedVersion();
 
         // use branch alias for sorting if one is provided
         if (isset($a->getExtra()['branch-alias'][$aVersion])) {
-            $aVersion = preg_replace('{(.x)?-dev$}', '.9999999-dev', $a->getExtra()['branch-alias'][$aVersion]);
+            $aVersion = Preg::replace('{(.x)?-dev$}', '.9999999-dev', $a->getExtra()['branch-alias'][$aVersion]);
         }
         if (isset($b->getExtra()['branch-alias'][$bVersion])) {
-            $bVersion = preg_replace('{(.x)?-dev$}', '.9999999-dev', $b->getExtra()['branch-alias'][$bVersion]);
+            $bVersion = Preg::replace('{(.x)?-dev$}', '.9999999-dev', $b->getExtra()['branch-alias'][$bVersion]);
         }
 
-        $aVersion = preg_replace('{^dev-.*}', '0.0.0-alpha', $aVersion);
-        $bVersion = preg_replace('{^dev-.*}', '0.0.0-alpha', $bVersion);
+        $aVersion = Preg::replace('{^dev-.*}', '0.0.0-alpha', $aVersion);
+        $bVersion = Preg::replace('{^dev-.*}', '0.0.0-alpha', $bVersion);
 
         // sort default branch first if it is non numeric
         if ($aVersion === '0.0.0-alpha' && $a->isDefaultBranch()) {

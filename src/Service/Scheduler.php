@@ -11,15 +11,15 @@ class Scheduler
 {
     use \App\Util\DoctrineTrait;
 
-    private ManagerRegistry $doctrine;
-    private RedisClient $redis;
-
-    public function __construct(RedisClient $redis, ManagerRegistry $doctrine)
-    {
-        $this->doctrine = $doctrine;
-        $this->redis = $redis;
+    public function __construct(
+        private RedisClient $redis,
+        private ManagerRegistry $doctrine
+    ) {
     }
 
+    /**
+     * @param Package|int $packageOrId
+     */
     public function scheduleUpdate($packageOrId, bool $updateEqualRefs = false, bool $deleteBefore = false, ?\DateTimeInterface $executeAfter = null, bool $forceDump = false): Job
     {
         if ($packageOrId instanceof Package) {
@@ -29,9 +29,7 @@ class Scheduler
         }
 
         $pendingJobId = $this->getPendingUpdateJob($packageOrId, $updateEqualRefs, $deleteBefore);
-        if ($pendingJobId) {
-            $pendingJob = $this->getEM()->getRepository(Job::class)->findOneBy(['id' => $pendingJobId]);
-
+        if ($pendingJobId && ($pendingJob = $this->getEM()->getRepository(Job::class)->findOneBy(['id' => $pendingJobId])) !== null) {
             // pending job will execute before the one we are trying to schedule so skip scheduling
             if (
                 (!$pendingJob->getExecuteAfter() && $executeAfter)
@@ -59,12 +57,12 @@ class Scheduler
         return $this->createJob('githubuser:migrate', ['id' => $userId, 'old_scope' => $oldScope, 'new_scope' => $newScope], $userId);
     }
 
-    public function scheduleSecurityAdvisory(string $source, ?\DateTimeInterface $executeAfter = null): Job
+    public function scheduleSecurityAdvisory(string $source, int $packageId, ?\DateTimeInterface $executeAfter = null): Job
     {
-        return $this->createJob('security:advisory', ['source' => $source], null, $executeAfter);
+        return $this->createJob('security:advisory', ['source' => $source], $packageId, $executeAfter);
     }
 
-    private function getPendingUpdateJob(int $packageId, $updateEqualRefs = false, $deleteBefore = false): ?string
+    private function getPendingUpdateJob(int $packageId, bool $updateEqualRefs = false, bool $deleteBefore = false): ?string
     {
         $result = $this->getEM()->getConnection()->fetchAssociative(
             'SELECT id, payload FROM job WHERE packageId = :package AND status = :status AND type = :type LIMIT 1',
@@ -86,7 +84,7 @@ class Scheduler
     }
 
     /**
-     * @return array [status => x, message => y]
+     * @return array{status: string, message: string}
      */
     public function getJobStatus(string $jobId): array
     {
@@ -101,7 +99,7 @@ class Scheduler
 
     /**
      * @param  Job[]   $jobs
-     * @return array[]
+     * @return array<string, array{status: mixed}>
      */
     public function getJobsStatus(array $jobs): array
     {
@@ -121,6 +119,10 @@ class Scheduler
         return $results;
     }
 
+    /**
+     * @param int|null $packageId
+     * @param \DateTimeInterface|null $executeAfter
+     */
     private function createJob(string $type, array $payload, $packageId = null, $executeAfter = null): Job
     {
         $jobId = bin2hex(random_bytes(20));

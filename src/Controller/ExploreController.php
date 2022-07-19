@@ -17,13 +17,11 @@ use App\Model\FavoriteManager;
 use Doctrine\DBAL\ConnectionException;
 use App\Entity\Package;
 use App\Entity\Version;
-use App\Entity\PackageRepository;
-use App\Entity\VersionRepository;
 use Pagerfanta\Adapter\FixedAdapter;
 use Pagerfanta\Pagerfanta;
-use Sensio\Bundle\FrameworkExtraBundle\Configuration\Template;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\Routing\Annotation\Route;
 use Symfony\Component\Routing\Generator\UrlGeneratorInterface;
 use Predis\Client as RedisClient;
@@ -35,19 +33,16 @@ use Symfony\Component\HttpKernel\EventListener\AbstractSessionListener;
 class ExploreController extends Controller
 {
     /**
-     * @Template()
      * @Route("/", name="browse")
      */
-    public function exploreAction(RedisClient $redis)
+    public function exploreAction(RedisClient $redis): Response
     {
-        /** @var PackageRepository $pkgRepo */
-        $pkgRepo = $this->doctrine->getRepository(Package::class);
-        /** @var VersionRepository $verRepo */
-        $verRepo = $this->doctrine->getRepository(Version::class);
+        $pkgRepo = $this->getEM()->getRepository(Package::class);
+        $verRepo = $this->getEM()->getRepository(Version::class);
         $newSubmitted = $pkgRepo->getQueryBuilderForNewestPackages()->setMaxResults(10)
             ->getQuery()->enableResultCache(60)->getResult();
         $newReleases = $verRepo->getLatestReleases(10);
-        $maxId = $this->doctrine->getConnection()->fetchColumn('SELECT max(id) FROM package');
+        $maxId = (int) $this->getEM()->getConnection()->fetchOne('SELECT max(id) FROM package');
         $random = $pkgRepo
             ->createQueryBuilder('p')->where('p.id >= :randId')->andWhere('p.abandoned = 0')
             ->setParameter('randId', rand(1, $maxId))->setMaxResults(10)
@@ -66,19 +61,18 @@ class ExploreController extends Controller
             $popular = [];
         }
 
-        return [
+        return $this->render('explore/explore.html.twig', [
             'newlySubmitted' => $newSubmitted,
             'newlyReleased' => $newReleases,
             'random' => $random,
             'popular' => $popular,
-        ];
+        ]);
     }
 
     /**
-     * @Template()
      * @Route("/popular.{_format}", name="browse_popular", defaults={"_format"="html"})
      */
-    public function popularAction(Request $req, RedisClient $redis, FavoriteManager $favMgr, DownloadManager $dlMgr)
+    public function popularAction(Request $req, RedisClient $redis, FavoriteManager $favMgr, DownloadManager $dlMgr): Response
     {
         $perPage = $req->query->getInt('per_page', 15);
         try {
@@ -90,15 +84,15 @@ class ExploreController extends Controller
                     ], 400);
                 }
 
-                $perPage = max(0, min(100, $perPage));
             }
+            $perPage = max(1, min(100, $perPage));
 
             $popularIds = $redis->zrevrange(
                 'downloads:trending',
                 (max(1, (int) $req->get('page', 1)) - 1) * $perPage,
                 max(1, (int) $req->get('page', 1)) * $perPage - 1
             );
-            $popular = $this->doctrine->getRepository(Package::class)
+            $popular = $this->getEM()->getRepository(Package::class)
                 ->createQueryBuilder('p')->where('p.id IN (:ids)')->setParameter('ids', $popularIds)
                 ->getQuery()->enableResultCache(900)->getResult();
             usort($popular, function ($a, $b) use ($popularIds) {
@@ -108,7 +102,7 @@ class ExploreController extends Controller
             $packages = new Pagerfanta(new FixedAdapter($redis->zcard('downloads:trending'), $popular));
             $packages->setNormalizeOutOfRangePages(true);
             $packages->setMaxPerPage($perPage);
-            $packages->setCurrentPage($req->get('page', 1));
+            $packages->setCurrentPage(max(1, $req->query->getInt('page', 1)));
         } catch (ConnectionException $e) {
             $packages = new Pagerfanta(new FixedAdapter(0, []));
         }
@@ -155,6 +149,6 @@ class ExploreController extends Controller
             return $response;
         }
 
-        return $data;
+        return $this->render('explore/popular.html.twig', $data);
     }
 }

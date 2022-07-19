@@ -4,9 +4,12 @@ namespace App\Redis;
 
 class FailedLoginCounter extends \Predis\Command\ScriptCommand
 {
-    private $args;
+    /**
+     * @var array<string|int>
+     */
+    private array $args;
 
-    public function getKeysCount()
+    public function getKeysCount(): int
     {
         if (!$this->args) {
             throw new \LogicException('getKeysCount called before filterArguments');
@@ -15,14 +18,18 @@ class FailedLoginCounter extends \Predis\Command\ScriptCommand
         return count($this->args);
     }
 
-    protected function filterArguments(array $arguments)
+    /**
+     * @param  array<string|int> $arguments
+     * @return array<string|int>
+     */
+    protected function filterArguments(array $arguments): array
     {
         $this->args = $arguments;
 
         return parent::filterArguments($arguments);
     }
 
-    public function getScript()
+    public function getScript(): string
     {
         return <<<LUA
 for i, key in ipairs(KEYS) do
@@ -32,4 +39,3 @@ end
 LUA;
     }
 }
-

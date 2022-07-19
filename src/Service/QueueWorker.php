@@ -13,20 +13,16 @@ class QueueWorker
 {
     use \App\Util\DoctrineTrait;
 
-    private Redis $redis;
-    private Logger $logger;
-    private ManagerRegistry $doctrine;
-    private array $jobWorkers;
     private int $processedJobs = 0;
-    private StatsDClient $statsd;
 
-    public function __construct(Redis $redis, ManagerRegistry $doctrine, Logger $logger, array $jobWorkers, StatsDClient $statsd)
-    {
-        $this->redis = $redis;
-        $this->logger = $logger;
-        $this->doctrine = $doctrine;
-        $this->jobWorkers = $jobWorkers;
-        $this->statsd = $statsd;
+    public function __construct(
+        private Redis $redis,
+        private ManagerRegistry $doctrine,
+        private Logger $logger,
+        /** @var array<string, UpdaterWorker|GitHubUserMigrationWorker|SecurityAdvisoryWorker> */
+        private array $jobWorkers,
+        private StatsDClient $statsd
+    ) {
     }
 
     public function processMessages(int $count): void
@@ -98,6 +94,9 @@ class QueueWorker
         }
 
         $job = $repo->find($jobId);
+        if (null === $job) {
+            throw new \LogicException('At this point a job should always be found');
+        }
 
         $this->logger->pushProcessor(function ($record) use ($job) {
             $record['extra']['job-id'] = $job->getId();
@@ -146,6 +145,9 @@ class QueueWorker
         $repo = $em->getRepository(Job::class);
 
         if ($result['status'] === Job::STATUS_RESCHEDULE) {
+            if (!isset($result['after'])) {
+                throw new \LogicException('$result must have an "after" key when returning a reschedule status.');
+            }
             $job->reschedule($result['after']);
             $em->flush($job);
 
@@ -169,6 +171,9 @@ class QueueWorker
         }
 
         $job = $repo->find($jobId);
+        if (null === $job) {
+            throw new \LogicException('At this point a job should always be found');
+        }
         $job->complete($result);
 
         $this->redis->setex('job-'.$job->getId(), 600, json_encode($result));

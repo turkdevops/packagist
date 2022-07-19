@@ -22,12 +22,12 @@ use Symfony\Component\OptionsResolver\OptionsResolver;
  */
 class AddMaintainerRequestType extends AbstractType
 {
-    public function buildForm(FormBuilderInterface $builder, array $options)
+    public function buildForm(FormBuilderInterface $builder, array $options): void
     {
         $builder->add('user');
     }
 
-    public function configureOptions(OptionsResolver $resolver)
+    public function configureOptions(OptionsResolver $resolver): void
     {
         $resolver->setDefaults([
             'data_class' => MaintainerRequest::class,
@@ -37,7 +37,7 @@ class AddMaintainerRequestType extends AbstractType
     /**
      * @inheritDoc
      */
-    public function getBlockPrefix()
+    public function getBlockPrefix(): string
     {
         return 'add_maintainer_form';
     }

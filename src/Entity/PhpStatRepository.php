@@ -2,12 +2,16 @@
 
 namespace App\Entity;
 
+use Composer\Pcre\Preg;
 use Doctrine\Bundle\DoctrineBundle\Repository\ServiceEntityRepository;
 use Doctrine\DBAL\Connection;
 use Doctrine\Persistence\ManagerRegistry;
 use Predis\Client;
 use DateTimeImmutable;
 
+/**
+ * @extends ServiceEntityRepository<PhpStat>
+ */
 class PhpStatRepository extends ServiceEntityRepository
 {
     public function __construct(ManagerRegistry $registry, private Client $redis)
@@ -120,7 +124,7 @@ class PhpStatRepository extends ServiceEntityRepository
 
         foreach ($keys as $index => $key) {
             // strip php minor version and date from the key to get the primary prefix (i.e. type:package-version:*)
-            $prefix = preg_replace('{:\d+\.\d+:\d+$}', ':', $key);
+            $prefix = Preg::replace('{:\d+\.\d+:\d+$}', ':', $key);
 
             if ($lastPrefix && $prefix !== $lastPrefix && $buffer) {
                 $addedData = $this->createDbRecordsForKeys($package, $buffer, $now) || $addedData;
@@ -136,6 +140,8 @@ class PhpStatRepository extends ServiceEntityRepository
             $addedData = $this->createDbRecordsForKeys($package, $buffer, $now) || $addedData;
             $this->redis->del(array_keys($buffer));
         }
+
+        $this->getEntityManager()->flush();
 
         if ($addedData) {
             $this->createOrUpdateMainRecord($package, PhpStat::TYPE_PHP, $now, $updateDateForMajor);
@@ -154,7 +160,7 @@ class PhpStatRepository extends ServiceEntityRepository
         $majorRecord = null;
         $record = $this->createOrUpdateRecord($package, $info['type'], $info['version'], $keys, $now);
         // create an aggregate major version data point by summing up all the minor versions under it
-        if ($record && $record->getDepth() === PhpStat::DEPTH_MINOR && preg_match('{^\d+}', $record->getVersion(), $match)) {
+        if ($record && $record->getDepth() === PhpStat::DEPTH_MINOR && Preg::isMatch('{^\d+}', $record->getVersion(), $match)) {
             $majorRecord = $this->createOrUpdateRecord($package, $info['type'], $match[0], $keys, $now);
         }
 
@@ -164,6 +170,7 @@ class PhpStatRepository extends ServiceEntityRepository
     private function createOrUpdateRecord(Package $package, int $type, string $version, array $keys, DateTimeImmutable $now): ?PhpStat
     {
         $record = $this->getEntityManager()->getRepository(PhpStat::class)->findOneBy(['package' => $package, 'type' => $type, 'version' => $version]);
+        $newRecord = !$record;
 
         if (!$record) {
             $record = new PhpStat($package, $type, $version);
@@ -187,7 +194,9 @@ class PhpStatRepository extends ServiceEntityRepository
             $record->setLastUpdated($now);
 
             $this->getEntityManager()->persist($record);
-            $this->getEntityManager()->flush();
+            if ($newRecord) {
+                $this->getEntityManager()->flush();
+            }
 
             return $record;
         }
@@ -204,6 +213,7 @@ class PhpStatRepository extends ServiceEntityRepository
             ['package' => $package->getId(), 'type' => $type, 'exact' => PhpStat::DEPTH_EXACT, 'major' => PhpStat::DEPTH_MAJOR]
         );
 
+        $minorPhpVersions = array_filter($minorPhpVersions, fn($version) => is_string($version));
         if (!$minorPhpVersions) {
             return;
         }
@@ -223,10 +233,11 @@ class PhpStatRepository extends ServiceEntityRepository
             'SELECT '.implode(', ', $sumQueries).' FROM php_stat p WHERE p.package_id = :package AND p.type = :type AND p.depth IN (:exact, :major)',
             ['package' => $package->getId(), 'type' => $type, 'exact' => PhpStat::DEPTH_EXACT, 'major' => PhpStat::DEPTH_MAJOR]
         );
+        assert(is_array($sums));
 
         foreach ($minorPhpVersions as $index => $version) {
-            if ($sums[$index]) {
-                $record->setDataPoint($version, $dataPointDate, $sums[$index]);
+            if (is_numeric($sums[$index]) && $sums[$index] > 0) {
+                $record->setDataPoint($version, $dataPointDate, (int) $sums[$index]);
             }
         }
 
@@ -241,7 +252,7 @@ class PhpStatRepository extends ServiceEntityRepository
      */
     private function getKeyInfo(Package $package, string $key): array
     {
-        if (!preg_match('{^php(?<platform>platform)?:(?<package>\d+)-(?<version>.+):(?<phpversion>\d+\.\d+|hhvm):(?<date>\d+)$}', $key, $match)) {
+        if (!Preg::isMatch('{^php(?<platform>platform)?:(?<package>\d+)-(?<version>.+):(?<phpversion>\d+\.\d+|hhvm):(?<date>\d+)$}', $key, $match)) {
             throw new \LogicException('Could not parse key: '.$key);
         }
 

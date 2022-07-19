@@ -2,6 +2,7 @@
 
 namespace App\Service;
 
+use Composer\Pcre\Preg;
 use Psr\Log\LoggerInterface;
 use Doctrine\Persistence\ManagerRegistry;
 use App\Entity\Package;
@@ -9,8 +10,11 @@ use App\Entity\User;
 use App\Entity\Job;
 use App\Util\DoctrineTrait;
 use Seld\Signal\SignalHandler;
-use GuzzleHttp\Client;
-use GuzzleHttp\Psr7\Response;
+use Symfony\Component\HttpClient\NoPrivateNetworkHttpClient;
+use Symfony\Contracts\HttpClient\Exception\DecodingExceptionInterface;
+use Symfony\Contracts\HttpClient\Exception\HttpExceptionInterface;
+use Symfony\Contracts\HttpClient\Exception\TransportExceptionInterface;
+use Symfony\Contracts\HttpClient\ResponseInterface;
 
 class GitHubUserMigrationWorker
 {
@@ -19,19 +23,29 @@ class GitHubUserMigrationWorker
     const HOOK_URL = 'https://packagist.org/api/github';
     const HOOK_URL_ALT = 'https://packagist.org/api/update-package';
 
-    private LoggerInterface $logger;
-    private ManagerRegistry $doctrine;
-    private Client $guzzle;
-    private string $githubWebhookSecret;
-
-    public function __construct(LoggerInterface $logger, ManagerRegistry $doctrine, Client $guzzle, string $githubWebhookSecret)
-    {
-        $this->logger = $logger;
-        $this->doctrine = $doctrine;
-        $this->guzzle = $guzzle;
-        $this->githubWebhookSecret = $githubWebhookSecret;
+    public function __construct(
+        private LoggerInterface $logger,
+        private ManagerRegistry $doctrine,
+        private NoPrivateNetworkHttpClient $httpClient,
+        private string $githubWebhookSecret,
+    ) {
     }
 
+    /**
+     * @return array{
+     *     status: Job::STATUS_*,
+     *     message: string,
+     *     after?: \DateTime,
+     *     results?: array{
+     *         hooks_setup: int,
+     *         hooks_failed: array<int, array{
+     *             package: string,
+     *             reason: mixed
+     *         }>,
+     *         hooks_ok_unchanged: int
+     *     }
+     * }
+     */
     public function process(Job $job, SignalHandler $signal): array
     {
         $em = $this->getEM();
@@ -44,6 +58,11 @@ class GitHubUserMigrationWorker
             $this->logger->info('User is gone, skipping', ['id' => $id]);
 
             return ['status' => Job::STATUS_COMPLETED, 'message' => 'User was deleted, skipped'];
+        }
+        if (null === $user->getGithubToken()) {
+            $this->logger->info('User has no GitHub token setup, skipping', ['id' => $id]);
+
+            return ['status' => Job::STATUS_ERRORED, 'message' => 'User has no GitHub token setup, skipped'];
         }
 
         try {
@@ -59,7 +78,7 @@ class GitHubUserMigrationWorker
                 }
                 // null result means not processed as not a github-like URL
             }
-        } catch (\GuzzleHttp\Exception\ServerException | \GuzzleHttp\Exception\ConnectException $e) {
+        } catch (TransportExceptionInterface | DecodingExceptionInterface | HttpExceptionInterface $e) {
             return [
                 'status' => Job::STATUS_RESCHEDULE,
                 'message' => 'Got error, rescheduling: '.$e->getMessage(),
@@ -74,9 +93,9 @@ class GitHubUserMigrationWorker
         ];
     }
 
-    public function setupWebHook(string $token, Package $package)
+    public function setupWebHook(string $token, Package $package): null|bool|string
     {
-        if (!preg_match('#^(?:(?:https?|git)://([^/]+)/|git@([^:]+):)(?P<owner>[^/]+)/(?P<repo>.+?)(?:\.git|/)?$#', $package->getRepository(), $match)) {
+        if (!Preg::isMatch('#^(?:(?:https?|git)://([^/]+)/|git@([^:]+):)(?P<owner>[^/]+)/(?P<repo>.+?)(?:\.git|/)?$#', $package->getRepository(), $match)) {
             return null;
         }
 
@@ -131,25 +150,25 @@ class GitHubUserMigrationWorker
                 $this->logger->debug('Creating hook');
                 $resp = $this->request($token, 'POST', 'repos/'.$repoKey.'/hooks', $hookData);
                 if ($resp->getStatusCode() === 201) {
-                    $hooks[] = json_decode((string) $resp->getBody(), true);
+                    $hooks[] = $resp->toArray();
                     $changed = true;
                 }
             }
 
-            if (count($hooks) && !preg_match('{^https://api\.github\.com/repos/'.$repoKey.'/hooks/}', $hooks[0]['url'])) {
-                if (preg_match('{https://api\.github\.com/repos/([^/]+/[^/]+)/hooks}', $hooks[0]['url'], $match)) {
+            if (count($hooks) && !Preg::isMatch('{^https://api\.github\.com/repos/'.$repoKey.'/hooks/}', $hooks[0]['url'])) {
+                if (Preg::isMatch('{https://api\.github\.com/repos/([^/]+/[^/]+)/hooks}', $hooks[0]['url'], $match)) {
                     $package->setRepository('https://github.com/'.$match[1]);
                     $this->getEM()->flush($package);
                 }
             }
-        } catch (\GuzzleHttp\Exception\ClientException $e) {
+        } catch (HttpExceptionInterface $e) {
             if ($msg = $this->isAcceptableException($e)) {
                 $this->logger->debug($msg);
 
                 return $msg;
             }
 
-            $this->logger->error('Rejected GitHub hook request', ['response' => (string) $e->getResponse()->getBody()]);
+            $this->logger->error('Rejected GitHub hook request', ['response' => (string) $e->getResponse()->getContent(false)]);
 
             throw $e;
         }
@@ -159,7 +178,7 @@ class GitHubUserMigrationWorker
 
     public function deleteWebHook(string $token, Package $package): bool
     {
-        if (!preg_match('#^(?:(?:https?|git)://([^/]+)/|git@([^:]+):)(?P<owner>[^/]+)/(?P<repo>.+?)(?:\.git|/)?$#', $package->getRepository(), $match)) {
+        if (!Preg::isMatch('#^(?:(?:https?|git)://([^/]+)/|git@([^:]+):)(?P<owner>[^/]+)/(?P<repo>.+?)(?:\.git|/)?$#', $package->getRepository(), $match)) {
             return true;
         }
 
@@ -176,7 +195,7 @@ class GitHubUserMigrationWorker
                     $this->request($token, 'DELETE', 'repos/'.$repoKey.'/hooks/'.$hook['id']);
                 }
             }
-        } catch (\GuzzleHttp\Exception\ClientException $e) {
+        } catch (HttpExceptionInterface $e) {
             if ($msg = $this->isAcceptableException($e)) {
                 $this->logger->debug($msg);
 
@@ -189,6 +208,19 @@ class GitHubUserMigrationWorker
         return true;
     }
 
+    /**
+     * @return array<int, array{
+     *     id: int,
+     *     name: string,
+     *     active: bool,
+     *     events: string[],
+     *     config: array{
+     *         url: string,
+     *         secret: string
+     *     },
+     *     updated_at: string
+     * }>
+     */
     private function getHooks(string $token, string $repoKey): array
     {
         $hooks = [];
@@ -196,10 +228,10 @@ class GitHubUserMigrationWorker
 
         do {
             $resp = $this->request($token, 'GET', 'repos/'.$repoKey.'/hooks'.$page);
-            $hooks = array_merge($hooks, json_decode((string) $resp->getBody(), true));
+            $hooks = array_merge($hooks, $resp->toArray());
             $hasNext = false;
-            foreach ($resp->getHeader('Link') as $header) {
-                if (preg_match('{<https://api.github.com/resource?page=(?P<page>\d+)>; rel="next"}', $header, $match)) {
+            foreach ($resp->getHeaders()['link'] ?? [] as $header) {
+                if (Preg::isMatch('{<https://api.github.com/resource?page=(?P<page>\d+)>; rel="next"}', $header, $match)) {
                     $hasNext = true;
                     $page = '?page='.$match['page'];
                 }
@@ -209,22 +241,35 @@ class GitHubUserMigrationWorker
         return $hooks;
     }
 
-    private function request(string $token, string $method, string $url, array $json = null): Response
+    /**
+     * @param array<int|string, mixed>|null $json
+     */
+    private function request(string $token, string $method, string $url, array $json = null): ResponseInterface
     {
         $opts = [
-            'headers' => ['Accept' => 'application/vnd.github.v3+json', 'Authorization' => 'token '.$token],
+            'headers' => ['Accept: application/vnd.github.v3+json', 'Authorization: token '.$token],
         ];
 
         if ($json) {
             $opts['json'] = $json;
         }
 
-        /** @var Response $response */
-        $response = $this->guzzle->request($method, 'https://api.github.com/' . $url, $opts);
-
-        return $response;
+        return $this->httpClient->request($method, 'https://api.github.com/' . $url, $opts);
     }
 
+    /**
+     * @return array{
+     *     name: string,
+     *     config: array{
+     *         url: string,
+     *         content_type: string,
+     *         secret: string,
+     *         insecure_ssl: int
+     *     },
+     *     events: string[],
+     *     active: bool
+     * }
+     */
     private function getGitHubHookData(): array
     {
         return [
@@ -242,15 +287,25 @@ class GitHubUserMigrationWorker
         ];
     }
 
-    private function isAcceptableException(\Throwable $e)
+    private function isAcceptableException(HttpExceptionInterface $e): string|false
     {
+        $message = $e->getResponse()->toArray(false)['message'];
+
         // repo not found probably means the user does not have admin access to it on github
         if ($e->getCode() === 404) {
             return 'GitHub user has no admin access to the repository, or Packagist was not granted access to the organization (<a href="https://github.com/settings/connections/applications/a059f127e1c09c04aa5a">check here</a>)';
         }
 
-        if ($e->getCode() === 403 && strpos($e->getMessage(), 'Repository was archived so is read-only') !== false) {
+        if ($e->getCode() === 403 && str_contains($message, 'Repository was archived so is read-only')) {
             return 'The repository is archived and read-only';
+        }
+
+        if ($e->getCode() === 403) {
+            return $message;
+        }
+
+        if ($e->getCode() === 401 && str_contains($message, 'Bad credentials')) {
+            return 'Invalid credentials to access this repository';
         }
 
         return false;

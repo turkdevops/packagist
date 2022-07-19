@@ -12,6 +12,8 @@
 
 namespace App\Model;
 
+use App\Redis\DownloadsIncr;
+use Composer\Pcre\Preg;
 use Doctrine\Persistence\ManagerRegistry;
 use Doctrine\DBAL\Connection;
 use App\Entity\Package;
@@ -20,6 +22,7 @@ use App\Entity\Download;
 use App\Util\DoctrineTrait;
 use Predis\Client;
 use DateTimeImmutable;
+use Predis\Profile\RedisProfile;
 
 /**
  * Manages the download counts for packages.
@@ -28,24 +31,18 @@ class DownloadManager
 {
     use DoctrineTrait;
 
-    protected Client $redis;
-    protected ManagerRegistry $doctrine;
     protected bool $redisCommandLoaded = false;
 
-    public function __construct(Client $redis, ManagerRegistry $doctrine)
+    public function __construct(private Client $redis, private ManagerRegistry $doctrine)
     {
-        $this->redis = $redis;
-        $this->doctrine = $doctrine;
     }
 
     /**
      * Gets the total, monthly, and daily download counts for an entire package or optionally a version.
      *
-     * @param \App\Entity\Package|int      $package
-     * @param \App\Entity\Version|int|null $version
-     * @return array
+     * @return array{total: int, monthly: int, daily: float, views?: int}
      */
-    public function getDownloads($package, $version = null, bool $incrViews = false)
+    public function getDownloads(Package|int $package, Version|int $version = null, bool $incrViews = false): array
     {
         if ($package instanceof Package) {
             $package = $package->getId();
@@ -70,7 +67,7 @@ class DownloadManager
 
         $keyBase .= ':';
         $date = new \DateTime();
-        $todayDate = $date->format('Ymd');
+        $todayDate = (int) $date->format('Ymd');
         $yesterdayDate = date('Ymd', ((int) $date->format('U')) - 86400);
 
         // fetch today, yesterday and the latest total from redis
@@ -79,9 +76,9 @@ class DownloadManager
         for ($i = 0; $i < 30; $i++) {
             // current day and previous day might not be in db yet or incomplete, so we take the data from redis if there is still data there
             if ($i <= 1) {
-                $monthly += $redisData[$i] ?? $dlData[$date->format('Ymd')] ?? 0;
+                $monthly += $redisData[$i] ?? $dlData[(int) $date->format('Ymd')] ?? 0;
             } else {
-                $monthly += $dlData[$date->format('Ymd')] ?? 0;
+                $monthly += $dlData[(int) $date->format('Ymd')] ?? 0;
             }
             $date->modify('-1 day');
         }
@@ -109,11 +106,8 @@ class DownloadManager
 
     /**
      * Gets the total download count for a package.
-     *
-     * @param \App\Entity\Package|int $package
-     * @return int
      */
-    public function getTotalDownloads($package)
+    public function getTotalDownloads(Package|int $package): int
     {
         if ($package instanceof Package) {
             $package = $package->getId();
@@ -125,10 +119,10 @@ class DownloadManager
     /**
      * Gets total download counts for multiple package IDs.
      *
-     * @param array $packageIds
-     * @return array a map of package ID to download count
+     * @param array<int> $packageIds
+     * @return array<int, int> a map of package ID to download count
      */
-    public function getPackagesDownloads(array $packageIds)
+    public function getPackagesDownloads(array $packageIds): array
     {
         $keys = [];
 
@@ -151,14 +145,18 @@ class DownloadManager
      *
      * @param list<array{id: int, vid: int, minor: string}> $jobs Each job contains id (package id), vid (version id) and ip keys
      */
-    public function addDownloads(array $jobs, string $ip, string $phpMinor, string $phpMinorPlatform)
+    public function addDownloads(array $jobs, string $ip, string $phpMinor, string $phpMinorPlatform): void
     {
-        $day = date('Ymd');
-        $month = date('Ym');
+        $now = time();
+        $throttleExpiry = strtotime('tomorrow 12:00:00', $now - 86400/2) * 1000;
+        $throttleDay = date('Ymd', $throttleExpiry);
+        $day = date('Ymd', $now);
+        $month = date('Ym', $now);
 
         if (!$this->redisCommandLoaded) {
-            /** @phpstan-ignore-next-line */
-            $this->redis->getProfile()->defineCommand('downloadsIncr', 'App\Redis\DownloadsIncr');
+            $profile = $this->redis->getProfile();
+            assert($profile instanceof RedisProfile);
+            $profile->defineCommand('downloadsIncr', DownloadsIncr::class);
             $this->redisCommandLoaded = true;
         }
 
@@ -180,7 +178,7 @@ class DownloadManager
             $minorVersion = str_replace(':', '', $job['minor']);
 
             // throttle key
-            $args[] = 'throttle:'.$package.':'.$day;
+            $args[] = 'throttle:'.$package.':'.$throttleDay;
             // stats keys
             $args[] = 'dl:'.$package;
             $args[] = 'dl:'.$package.':'.$day;
@@ -192,12 +190,16 @@ class DownloadManager
         $args[] = $ip;
         $args[] = $day;
         $args[] = $month;
+        $args[] = $throttleExpiry;
 
         /** @phpstan-ignore-next-line */
         $this->redis->downloadsIncr(...$args);
     }
 
-    public function transferDownloadsToDb(int $packageId, array $keys, DateTimeImmutable $now)
+    /**
+     * @param string[] $keys
+     */
+    public function transferDownloadsToDb(int $packageId, array $keys, DateTimeImmutable $now): void
     {
         $package = $this->getEM()->getRepository(Package::class)->find($packageId);
         // package was deleted in the meantime, abort
@@ -208,7 +210,7 @@ class DownloadManager
 
         $versionsWithDownloads = [];
         foreach ($keys as $key) {
-            if (preg_match('{^dl:'.$packageId.'-(\d+):\d+$}', $key, $match)) {
+            if (Preg::isMatch('{^dl:'.$packageId.'-(\d+):\d+$}', $key, $match)) {
                 $versionsWithDownloads[(int) $match[1]] = true;
             }
         }
@@ -229,7 +231,7 @@ class DownloadManager
         $lastPrefix = null;
 
         foreach ($keys as $index => $key) {
-            $prefix = preg_replace('{:\d+$}', ':', $key);
+            $prefix = Preg::replace('{:\d+$}', ':', $key);
 
             if ($lastPrefix && $prefix !== $lastPrefix && $buffer) {
                 $this->createDbRecordsForKeys($package, $buffer, $versionIds, $now);
@@ -253,10 +255,10 @@ class DownloadManager
      * @param array<string, int> $keys array of keys => dl count
      * @param list<int>    $validVersionIds
      */
-    private function createDbRecordsForKeys(Package $package, array $keys, array $validVersionIds, DateTimeImmutable $now)
+    private function createDbRecordsForKeys(Package $package, array $keys, array $validVersionIds, DateTimeImmutable $now): void
     {
         reset($keys);
-        list($id, $type) = $this->getKeyInfo(key($keys));
+        [$id, $type] = $this->getKeyInfo((string) key($keys));
 
         // skip if the version was deleted in the meantime
         if ($type === Download::TYPE_VERSION && !in_array($id, $validVersionIds, true)) {
@@ -267,7 +269,7 @@ class DownloadManager
         $isNewRecord = false;
         if (!$record) {
             $record = new Download();
-            $record->setId($id);
+            $record->setId((string) $id);
             $record->setType($type);
             $record->setPackage($package);
             $isNewRecord = true;
@@ -276,8 +278,13 @@ class DownloadManager
         $record->setLastUpdated($now);
 
         foreach ($keys as $key => $val) {
-            $date = preg_replace('{^.*?:(\d+)$}', '$1', $key);
-            if ($val) {
+            $date = null;
+            if (Preg::isMatch('{:(\d+)$}', $key, $match)) {
+                $date = $match[1];
+            } else {
+                throw new \LogicException('Malformed key does not end with a date stamp in form YYYYMMDD');
+            }
+            if ($val > 0) {
                 $record->setDataPoint($date, $val);
             }
         }
@@ -290,13 +297,16 @@ class DownloadManager
         $record->computeSum();
     }
 
+    /**
+     * @return array{0: int, 1: int}
+     */
     private function getKeyInfo(string $key): array
     {
-        if (preg_match('{^dl:(\d+):}', $key, $match)) {
+        if (Preg::isMatch('{^dl:(\d+):}', $key, $match)) {
             return [(int) $match[1], Download::TYPE_PACKAGE];
         }
 
-        if (preg_match('{^dl:\d+-(\d+):}', $key, $match)) {
+        if (Preg::isMatch('{^dl:\d+-(\d+):}', $key, $match)) {
             return [(int) $match[1], Download::TYPE_VERSION];
         }
 

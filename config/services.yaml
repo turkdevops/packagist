@@ -4,8 +4,6 @@
 # Put parameters here that don't need to change on each machine where the app is deployed
 # https://symfony.com/doc/current/best_practices/configuration.html#application-related-configuration
 parameters:
-    security.exception_listener.class: App\Security\ExceptionListener
-
     # default params which can be overriden by config/parameters.yaml
     force_ssl: false
     forced_ssl_hosts: []
@@ -14,7 +12,7 @@ parameters:
     packagist_dumper_compress: 0
     trusted_ip_header: ''
     github.webhook_secret: '%env(APP_GITHUB_WEBHOOK_SECRET)%'
-    google_analytics: null
+    fallback_gh_tokens: []
 
 services:
     # default configuration for services in *this* file
@@ -41,6 +39,8 @@ services:
             $recaptchaEnabled: "%env(bool:APP_RECAPTCHA_ENABLED)%"
             $mailFromEmail: "%env(APP_MAILER_FROM_EMAIL)%"
             $mailFromName: "%env(APP_MAILER_FROM_NAME)%"
+            $fallbackGhTokens: "%fallback_gh_tokens%"
+            $configDir: '%kernel.project_dir%/config/'
 
     # makes classes in src/ available to be used as services
     # this creates a service per class whose id is the fully-qualified class name
@@ -65,12 +65,19 @@ services:
 
     Graze\DogStatsD\Client: ~
 
-    GuzzleHttp\Client:
-        arguments: [{timeout: 3}]
-
     App\EventListener\CacheListener:
         tags:
             - { name: kernel.event_listener, event: kernel.response, method: onResponse }
+
+    App\EventListener\SecurityAdvisoryUpdateListener:
+        tags:
+            - { name: 'doctrine.orm.entity_listener', event: postUpdate, entity: App\Entity\SecurityAdvisory }
+            - { name: 'doctrine.orm.entity_listener', event: postPersist, entity: App\Entity\SecurityAdvisory }
+
+    App\ArgumentResolver\:
+        resource: '../src/ArgumentResolver/*.php'
+        tags:
+            - { name: controller.argument_value_resolver, priority: 101 } # Put these above RequestAttributeValueResolver
 
     App\Package\SymlinkDumper:
         arguments:
@@ -127,3 +134,9 @@ services:
         bind:
             $sources:
                 'FriendsOfPHP/security-advisories': '@App\SecurityAdvisory\FriendsOfPhpSecurityAdvisoriesSource'
+                'GitHub': '@App\SecurityAdvisory\GitHubSecurityAdvisoriesSource'
+
+    Symfony\Component\HttpFoundation\Session\Storage\Handler\RedisSessionHandler:
+        arguments: ['@snc_redis.cache', {prefix: 'sess:', ttl: 3600}]
+
+    Symfony\Component\HttpClient\NoPrivateNetworkHttpClient: ~

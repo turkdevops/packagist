@@ -12,6 +12,8 @@
 
 namespace App\Package;
 
+use Composer\Pcre\Preg;
+use Seld\Signal\SignalHandler;
 use Symfony\Component\Filesystem\Filesystem;
 use Composer\Util\Filesystem as ComposerFilesystem;
 use Doctrine\Persistence\ManagerRegistry;
@@ -102,11 +104,9 @@ class SymlinkDumper
     /**
      * Dump a set of packages to the web root
      *
-     * @param array   $packageIds
-     * @param Boolean $force
-     * @param Boolean $verbose
+     * @param int[]   $packageIds
      */
-    public function dump(array $packageIds, $force = false, $verbose = false)
+    public function dump(array $packageIds, bool $force = false, bool $verbose = false, ?SignalHandler $signal = null): bool
     {
         if (!MetadataDirCheck::isMetadataStoreMounted($this->awsMeta)) {
             throw new \RuntimeException('Metadata store not mounted, can not dump metadata');
@@ -137,6 +137,9 @@ class SymlinkDumper
             $buildDir = realpath($buildDirA);
             $oldBuildDir = realpath($buildDirB);
         }
+
+        assert(is_string($buildDir));
+        assert(is_string($oldBuildDir));
 
         // copy existing stuff for smooth BC transition
         if ($initialRun && !$force) {
@@ -179,6 +182,12 @@ class SymlinkDumper
         try {
             $modifiedIndividualFiles = [];
 
+            // make sure huge packages get processed first to avoid blowing out memory usage later
+            if (in_array(300981, $packageIds, true)) {
+                unset($packageIds[array_search(300981, $packageIds, true)]);
+                $packageIds = array_merge([300981], $packageIds);
+            }
+
             $total = count($packageIds);
             $current = 0;
             $step = 50;
@@ -208,8 +217,9 @@ class SymlinkDumper
                         $files = json_decode(file_get_contents($buildDir.'/'.$name.'.files'));
 
                         foreach ($files as $file) {
+                            assert(is_string($file));
                             if (substr_count($file, '/') > 1) { // handle old .files with p/*/*.json paths
-                                $file = preg_replace('{^p/}', '', $file);
+                                $file = Preg::replace('{^p/}', '', $file);
                             }
                             $this->loadIndividualFile($buildDir.'/'.$file, $file);
                             if (isset($this->individualFiles[$file]['packages'][$name])) {
@@ -227,7 +237,7 @@ class SymlinkDumper
                     $versionData = $versionRepo->getVersionData($versionIds);
                     foreach ($package->getVersions() as $version) {
                         foreach (array_slice($version->getNames($versionData), 0, 150) as $versionName) {
-                            if (!preg_match('{^[A-Za-z0-9_-][A-Za-z0-9_.-]*/[A-Za-z0-9_-][A-Za-z0-9_.-]*$}', $versionName) || strpos($versionName, '..')) {
+                            if (!Preg::isMatch('{^[A-Za-z0-9_-][A-Za-z0-9_.-]*/[A-Za-z0-9_-][A-Za-z0-9_.-]*$}', $versionName) || strpos($versionName, '..')) {
                                 continue;
                             }
 
@@ -242,7 +252,7 @@ class SymlinkDumper
 
                     // store affected files to clean up properly in the next update
                     $this->fs->mkdir(dirname($buildDir.'/'.$name));
-                    $this->writeFileNonAtomic($buildDir.'/'.$name.'.files', json_encode(array_keys($affectedFiles)));
+                    $this->writeFileNonAtomic($buildDir.'/'.$name.'.files', json_encode(array_keys($affectedFiles), JSON_THROW_ON_ERROR));
 
                     $dumpTimeUpdates[$dumpTime->format('Y-m-d H:i:s')][] = $package->getId();
 
@@ -263,7 +273,10 @@ class SymlinkDumper
                 $this->getEM()->clear();
                 $this->logger->reset();
 
-                /** @phpstan-ignore-next-line https://github.com/phpstan/phpstan/issues/5017 */
+                if ($signal !== null && $signal->isTriggered()) {
+                    $packageIds = [];
+                }
+
                 if ($current % 250 === 0 || !$packageIds || memory_get_usage() > 1024*1024*1024) {
                     if ($verbose) {
                         echo 'Dumping individual files'.PHP_EOL;
@@ -304,11 +317,18 @@ class SymlinkDumper
             $this->rootFile['notify-batch'] = $this->router->generate('track_download_batch', [], UrlGeneratorInterface::ABSOLUTE_URL);
             $this->rootFile['providers-url'] = $this->router->generate('home', []) . 'p/%package%$%hash%.json';
             $this->rootFile['metadata-url'] = $this->router->generate('home', []) . 'p2/%package%.json';
-            $this->rootFile['search'] = $this->router->generate('search', ['_format' => 'json'], UrlGeneratorInterface::ABSOLUTE_URL) . '?q=%query%&type=%type%';
+            $this->rootFile['metadata-changes-url'] = $this->router->generate('metadata_changes', [], UrlGeneratorInterface::ABSOLUTE_URL);
+            $this->rootFile['search'] = $this->router->generate('search_api', [], UrlGeneratorInterface::ABSOLUTE_URL) . '?q=%query%&type=%type%';
             $this->rootFile['list'] = $this->router->generate('list', [], UrlGeneratorInterface::ABSOLUTE_URL);
+            $this->rootFile['security-advisories'] = [
+                'metadata' => true, // whether advisories are part of the metadata v2 files
+                'api-url' => $this->router->generate('api_security_advisories', [], UrlGeneratorInterface::ABSOLUTE_URL),
+                'query-all' => true, // whether packages that are not part of the repo can be searched in the API
+            ];
             $this->rootFile['providers-api'] = str_replace('VND/PKG', '%package%', $this->router->generate('view_providers', ['name' => 'VND/PKG', '_format' => 'json'], UrlGeneratorInterface::ABSOLUTE_URL));
             $this->rootFile['warning'] = 'Support for Composer 1 is deprecated and some packages will not be available. You should upgrade to Composer 2. See https://blog.packagist.com/deprecating-composer-1-support/';
             $this->rootFile['warning-versions'] = '<1.99';
+            $this->rootFile['info'] = json_decode('"\u001b[37;44m#StandWith\u001b[30;43mUkraine\u001b[0m"');
 
             if ($verbose) {
                 echo 'Dumping individual listings'.PHP_EOL;
@@ -443,7 +463,7 @@ class SymlinkDumper
         return true;
     }
 
-    private function switchActiveWebDir($webDir, $buildDir)
+    private function switchActiveWebDir(string $webDir, string $buildDir): void
     {
         $newLink = $webDir.'/p-new';
         $oldLink = $webDir.'/p';
@@ -461,7 +481,7 @@ class SymlinkDumper
         }
     }
 
-    private function cloneDir($source, $target)
+    private function cloneDir(string $source, string $target): void
     {
         $this->removeDirectory($target);
         exec('cp -rpf '.escapeshellarg($source).' '.escapeshellarg($target), $output, $exit);
@@ -471,7 +491,7 @@ class SymlinkDumper
         }
     }
 
-    public function gc()
+    public function gc(): void
     {
         // build up array of safe files
         $safeFiles = [];
@@ -494,11 +514,16 @@ class SymlinkDumper
 
         $buildDirs = [realpath($this->buildDir.'/a'), realpath($this->buildDir.'/b')];
         shuffle($buildDirs);
+        assert(is_string($buildDirs[0]));
+        assert(is_string($buildDirs[1]));
 
         $this->cleanOldFiles($buildDirs[0], $buildDirs[1], $safeFiles);
     }
 
-    private function cleanOldFiles($buildDir, $oldBuildDir, $safeFiles)
+    /**
+     * @param array<string, bool> $safeFiles
+     */
+    private function cleanOldFiles(string $buildDir, string $oldBuildDir, array $safeFiles): void
     {
         $finder = Finder::create()->directories()->ignoreVCS(true)->in($buildDir);
         foreach ($finder as $vendorDir) {
@@ -554,7 +579,7 @@ class SymlinkDumper
         }
     }
 
-    private function dumpRootFile($file)
+    private function dumpRootFile(string $file): void
     {
         // sort all versions and packages to make sha1 consistent
         ksort($this->rootFile['packages']);
@@ -563,23 +588,28 @@ class SymlinkDumper
             ksort($this->rootFile['packages'][$package]);
         }
 
-        $json = json_encode($this->rootFile, JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE);
+        $json = json_encode($this->rootFile, JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR);
         $time = time();
 
         $this->writeFile($file, $json, $time);
         if ($this->compress) {
-            $this->writeFile($file . '.gz', gzencode($json, $this->compress), $time);
+            $encoded = gzencode($json, $this->compress);
+            assert(is_string($encoded));
+            $this->writeFile($file . '.gz', $encoded, $time);
         }
     }
 
-    private function dumpListing($path)
+    /**
+     * @return array{string, string}
+     */
+    private function dumpListing(string $path): array
     {
         $key = basename($path);
 
         // sort files to make hash consistent
         ksort($this->listings[$key]['providers']);
 
-        $json = json_encode($this->listings[$key], JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE);
+        $json = json_encode($this->listings[$key], JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR);
         $hash = hash('sha256', $json);
         $path = substr($path, 0, -5) . '$' . $hash . '.json';
         $time = time();
@@ -587,14 +617,16 @@ class SymlinkDumper
         if (!file_exists($path)) {
             $this->writeFile($path, $json, $time);
             if ($this->compress) {
-                $this->writeFile($path . '.gz', gzencode($json, $this->compress), $time);
+                $encoded = gzencode($json, $this->compress);
+                assert(is_string($encoded));
+                $this->writeFile($path . '.gz', $encoded, $time);
             }
         }
 
         return [$path, $hash];
     }
 
-    private function loadIndividualFile($path, $key)
+    private function loadIndividualFile(string $path, string $key): void
     {
         if (isset($this->individualFiles[$key])) {
             return;
@@ -609,7 +641,7 @@ class SymlinkDumper
         }
     }
 
-    private function dumpIndividualFiles($buildDir)
+    private function dumpIndividualFiles(string $buildDir): void
     {
         // dump individual files to build dir
         foreach ($this->individualFiles as $file => $dummy) {
@@ -620,7 +652,7 @@ class SymlinkDumper
         $this->individualFilesMtime = [];
     }
 
-    private function dumpIndividualFile($path, $key)
+    private function dumpIndividualFile(string $path, string $key): void
     {
         // sort all versions and packages to make sha1 consistent
         ksort($this->individualFiles[$key]['packages']);
@@ -630,7 +662,11 @@ class SymlinkDumper
 
         $this->fs->mkdir(dirname($path));
 
-        $json = json_encode($this->individualFiles[$key], JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE);
+        $flags = 0;
+        if (count($this->individualFiles[$key]['packages']) === 0) {
+            $flags = JSON_FORCE_OBJECT;
+        }
+        $json = json_encode($this->individualFiles[$key], $flags | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
         $this->writeFile($path, $json, $this->individualFilesMtime[$key]);
 
         // write the hashed provider file
@@ -638,7 +674,7 @@ class SymlinkDumper
         $this->writeFile($hashedFile, $json);
     }
 
-    private function dumpVersionToIndividualFile(Version $version, $file, $key, $versionData)
+    private function dumpVersionToIndividualFile(Version $version, string $file, string $key, array $versionData): void
     {
         $this->loadIndividualFile($file, $key);
         $data = $version->toArray($versionData);
@@ -653,7 +689,7 @@ class SymlinkDumper
         }
     }
 
-    private function clearDirectory($path)
+    private function clearDirectory(string $path): bool
     {
         if (!$this->removeDirectory($path)) {
             echo 'Could not remove the build dir entirely, aborting';
@@ -664,7 +700,7 @@ class SymlinkDumper
         return true;
     }
 
-    private function removeDirectory($path)
+    private function removeDirectory(string $path): bool
     {
         $retries = 5;
         do {
@@ -677,12 +713,17 @@ class SymlinkDumper
         return !is_dir($path);
     }
 
-    private function getTargetListingBlocks($now)
+    /**
+     * @return array<string|int, int>
+     */
+    private function getTargetListingBlocks(int $now): array
     {
         $blocks = [];
 
         // monday last week
-        $blocks['latest'] = strtotime('monday last week', $now);
+        $timestamp = strtotime('monday last week', $now);
+        assert(is_int($timestamp));
+        $blocks['latest'] = $timestamp;
 
         $month = date('n', $now);
         $month = ceil($month / 3) * 3 - 2; // 1 for months 1-3, 10 for months 10-12
@@ -697,14 +738,16 @@ class SymlinkDumper
         $year = (int) $block->format('Y');
 
         while ($year >= 2013) {
-            $blocks[''.$year] = strtotime($year.'-01-01');
+            $timestamp = strtotime($year.'-01-01');
+            assert(is_int($timestamp));
+            $blocks[$year] = $timestamp;
             $year--;
         }
 
         return $blocks;
     }
 
-    private function getTargetListing($file)
+    private function getTargetListing(string $file): string
     {
         static $blocks;
 
@@ -723,7 +766,7 @@ class SymlinkDumper
         return "provider-archived.json";
     }
 
-    private function writeFile($path, $contents, $mtime = null)
+    private function writeFile(string $path, string $contents, int $mtime = null): void
     {
         file_put_contents($path.'.tmp', $contents);
         if ($mtime !== null) {
@@ -736,7 +779,7 @@ class SymlinkDumper
         }
     }
 
-    private function writeFileNonAtomic($path, $contents)
+    private function writeFileNonAtomic(string $path, string $contents): void
     {
         file_put_contents($path, $contents);
 
@@ -745,7 +788,7 @@ class SymlinkDumper
         }
     }
 
-    private function copyWriteLog($from, $to)
+    private function copyWriteLog(string $from, string $to): void
     {
         foreach ($this->writeLog as $path => $op) {
             $path = str_replace($from, $to, $path);

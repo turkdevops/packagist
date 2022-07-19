@@ -15,6 +15,7 @@ namespace App\Entity;
 use App\Model\VersionIdCache;
 use Doctrine\DBAL\Cache\QueryCacheProfile;
 use Doctrine\DBAL\Connection;
+use Doctrine\ORM\QueryBuilder;
 use Predis\Client;
 use Doctrine\Bundle\DoctrineBundle\Repository\ServiceEntityRepository;
 use Doctrine\ORM\EntityManager;
@@ -22,33 +23,24 @@ use Doctrine\Persistence\ManagerRegistry;
 
 /**
  * @author Jordi Boggiano <j.boggiano@seld.be>
+ * @extends ServiceEntityRepository<Version>
  */
 class VersionRepository extends ServiceEntityRepository
 {
-    private $redis;
-
-    protected $supportedLinkTypes = [
-        'require',
-        'conflict',
-        'provide',
-        'replace',
-        'devRequire',
-        'suggest',
-    ];
-
     public function getEntityManager(): EntityManager
     {
         return parent::getEntityManager();
     }
 
-    public function __construct(ManagerRegistry $registry, Client $redisCache, private VersionIdCache $versionIdCache)
-    {
+    public function __construct(
+        ManagerRegistry $registry,
+        private Client $redisCache,
+        private VersionIdCache $versionIdCache,
+    ) {
         parent::__construct($registry, Version::class);
-
-        $this->redis = $redisCache;
     }
 
-    public function remove(Version $version)
+    public function remove(Version $version): void
     {
         $em = $this->getEntityManager();
         $package = $version->getPackage();
@@ -59,7 +51,6 @@ class VersionRepository extends ServiceEntityRepository
 
         $this->versionIdCache->deleteVersion($package, $version);
 
-        $em->getConnection()->executeQuery('DELETE FROM version_author WHERE version_id=:id', ['id' => $version->getId()]);
         $em->getConnection()->executeQuery('DELETE FROM version_tag WHERE version_id=:id', ['id' => $version->getId()]);
         $em->getConnection()->executeQuery('DELETE FROM link_suggest WHERE version_id=:id', ['id' => $version->getId()]);
         $em->getConnection()->executeQuery('DELETE FROM link_conflict WHERE version_id=:id', ['id' => $version->getId()]);
@@ -112,7 +103,10 @@ class VersionRepository extends ServiceEntityRepository
         return $res;
     }
 
-    public function getVersionData(array $versionIds)
+    /**
+     * @param int[] $versionIds
+     */
+    public function getVersionData(array $versionIds): array
     {
         $links = [
             'require' => 'link_require',
@@ -132,7 +126,6 @@ class VersionRepository extends ServiceEntityRepository
                 'conflict' => [],
                 'provide' => [],
                 'replace' => [],
-                'authors' => [],
                 'tags' => [],
             ];
         }
@@ -149,17 +142,6 @@ class VersionRepository extends ServiceEntityRepository
         }
 
         $rows = $this->getEntityManager()->getConnection()->fetchAllAssociative(
-            'SELECT va.version_id, name, email, homepage, role FROM author a JOIN version_author va ON va.author_id = a.id WHERE va.version_id IN (:ids)',
-            ['ids' => $versionIds],
-            ['ids' => Connection::PARAM_INT_ARRAY]
-        );
-        foreach ($rows as $row) {
-            $versionId = $row['version_id'];
-            unset($row['version_id']);
-            $result[$versionId]['authors'][] = array_filter($row);
-        }
-
-        $rows = $this->getEntityManager()->getConnection()->fetchAllAssociative(
             'SELECT vt.version_id, name FROM tag t JOIN version_tag vt ON vt.tag_id = t.id WHERE vt.version_id IN (:ids)',
             ['ids' => $versionIds],
             ['ids' => Connection::PARAM_INT_ARRAY]
@@ -172,10 +154,13 @@ class VersionRepository extends ServiceEntityRepository
         return $result;
     }
 
-    public function getVersionMetadataForUpdate(Package $package)
+    /**
+     * @return array<string, array{id: numeric-string, version: string, normalizedVersion: string, source: array{type: string|null, url: string|null, reference: string|null}|null, softDeletedAt: string|null}>
+     */
+    public function getVersionMetadataForUpdate(Package $package): array
     {
         $rows = $this->getEntityManager()->getConnection()->fetchAllAssociative(
-            'SELECT id, version, normalizedVersion, source, softDeletedAt, `authors` IS NULL as needs_author_migration FROM package_version v WHERE v.package_id = :id',
+            'SELECT id, version, normalizedVersion, source, softDeletedAt FROM package_version v WHERE v.package_id = :id',
             ['id' => $package->getId()]
         );
 
@@ -184,7 +169,6 @@ class VersionRepository extends ServiceEntityRepository
             if ($row['source']) {
                 $row['source'] = json_decode($row['source'], true);
             }
-            $row['needs_author_migration'] = (int) $row['needs_author_migration'];
             $versions[strtolower($row['normalizedVersion'])] = $row;
         }
 
@@ -197,10 +181,9 @@ class VersionRepository extends ServiceEntityRepository
     public function getFullVersion(int $versionId): Version
     {
         $qb = $this->getEntityManager()->createQueryBuilder();
-        $qb->select('v', 't', 'a')
+        $qb->select('v', 't')
             ->from('App\Entity\Version', 'v')
             ->leftJoin('v.tags', 't')
-            ->leftJoin('v.authors', 'a')
             ->where('v.id = :id')
             ->setParameter('id', $versionId);
 
@@ -212,9 +195,9 @@ class VersionRepository extends ServiceEntityRepository
      *
      * @param string $vendor optional vendor filter
      * @param string $package optional vendor/package filter
-     * @return \Doctrine\ORM\QueryBuilder
+     * @return QueryBuilder
      */
-    public function getQueryBuilderForLatestVersionWithPackage($vendor = null, $package = null)
+    public function getQueryBuilderForLatestVersionWithPackage($vendor = null, $package = null): QueryBuilder
     {
         $qb = $this->getEntityManager()->createQueryBuilder();
         $qb->select('v')
@@ -242,7 +225,7 @@ class VersionRepository extends ServiceEntityRepository
 
     public function getLatestReleases($count = 10)
     {
-        if ($cached = $this->redis->get('new_releases')) {
+        if ($cached = $this->redisCache->get('new_releases')) {
             return json_decode($cached, true);
         }
 
@@ -256,7 +239,7 @@ class VersionRepository extends ServiceEntityRepository
             ->setParameter('now', date('Y-m-d H:i:s'));
 
         $res = $qb->getQuery()->getResult();
-        $this->redis->setex('new_releases', 600, json_encode($res));
+        $this->redisCache->setex('new_releases', 600, json_encode($res));
 
         return $res;
     }

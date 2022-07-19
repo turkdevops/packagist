@@ -25,29 +25,36 @@ class EmptyReferenceCache
      * @ORM\Id
      * @ORM\OneToOne(targetEntity="App\Entity\Package")
      */
-    protected $package;
+    private Package $package;
 
     /**
      * @ORM\Column(type="array")
+     * @var list<string>
      */
-    protected $emptyReferences = [];
+    private array $emptyReferences = [];
 
     public function __construct(Package $package)
     {
         $this->package = $package;
     }
 
-    public function setPackage(Package $package)
+    public function setPackage(Package $package): void
     {
         $this->package = $package;
     }
 
-    public function setEmptyReferences(array $emptyReferences)
+    /**
+     * @param list<string> $emptyReferences
+     */
+    public function setEmptyReferences(array $emptyReferences): void
     {
         $this->emptyReferences = $emptyReferences;
     }
 
-    public function getEmptyReferences()
+    /**
+     * @return list<string>
+     */
+    public function getEmptyReferences(): array
     {
         return $this->emptyReferences;
     }

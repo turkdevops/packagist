@@ -21,7 +21,8 @@ use App\Model\VersionIdCache;
 use App\Service\GitHubUserMigrationWorker;
 use App\Service\Scheduler;
 use App\Util\UserAgentParser;
-use Sensio\Bundle\FrameworkExtraBundle\Configuration\ParamConverter;
+use Composer\Pcre\Preg;
+use Symfony\Component\HttpFoundation\BinaryFileResponse;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
@@ -49,37 +50,45 @@ class ApiController extends Controller
     /**
      * @Route("/packages.json", name="packages", defaults={"_format" = "json"}, methods={"GET"})
      */
-    public function packagesAction(string $webDir)
+    public function packagesAction(string $webDir): Response
     {
         // fallback if any of the dumped files exist
         $rootJson = $webDir.'/packages_root.json';
         if (file_exists($rootJson)) {
-            return new Response(file_get_contents($rootJson));
+            return new BinaryFileResponse($rootJson);
         }
         $rootJson = $webDir.'/packages.json';
         if (file_exists($rootJson)) {
-            return new Response(file_get_contents($rootJson));
+            return new BinaryFileResponse($rootJson);
         }
 
-        $this->logger->alert('packages.json is missing and the fallback controller is being hit, you need to use app/console packagist:dump');
+        $this->logger->alert('packages.json is missing and the fallback controller is being hit, you need to use bin/console packagist:dump');
 
-        return new Response('Horrible misconfiguration or the dumper script messed up, you need to use app/console packagist:dump', 404);
+        return new Response('Horrible misconfiguration or the dumper script messed up, you need to use bin/console packagist:dump', 404);
     }
 
     /**
      * @Route("/api/create-package", name="generic_create", defaults={"_format" = "json"}, methods={"POST"})
      */
-    public function createPackageAction(Request $request, ProviderManager $providerManager, GitHubUserMigrationWorker $githubUserMigrationWorker, RouterInterface $router, ValidatorInterface $validator)
+    public function createPackageAction(Request $request, ProviderManager $providerManager, GitHubUserMigrationWorker $githubUserMigrationWorker, RouterInterface $router, ValidatorInterface $validator): JsonResponse
     {
         $payload = json_decode($request->getContent(), true);
-        if (!$payload) {
+        if (!$payload || !is_array($payload)) {
             return new JsonResponse(['status' => 'error', 'message' => 'Missing payload parameter'], 406);
         }
+        if (!isset($payload['repository']['url']) || !is_string($payload['repository']['url'])) {
+            return new JsonResponse(['status' => 'error', 'message' => '{repository: {url: string}} expected in payload'], 406);
+        }
+
+        $user = $this->findUser($request);
+        if (null === $user) {
+            return new JsonResponse(['status' => 'error', 'message' => 'Missing username or apiToken in request'], 406);
+        }
+
         $url = $payload['repository']['url'];
         $package = new Package;
         $package->setEntityRepository($this->getEM()->getRepository(Package::class));
         $package->setRouter($router);
-        $user = $this->findUser($request);
         $package->addMaintainer($user);
         $package->setRepository($url);
         $errors = $validator->validate($package, groups: ['Default', 'Create']);
@@ -112,15 +121,15 @@ class ApiController extends Controller
      * @Route("/api/github", name="github_postreceive", defaults={"_format" = "json"}, methods={"POST"})
      * @Route("/api/bitbucket", name="bitbucket_postreceive", defaults={"_format" = "json"}, methods={"POST"})
      */
-    public function updatePackageAction(Request $request, string $githubWebhookSecret)
+    public function updatePackageAction(Request $request, string $githubWebhookSecret): JsonResponse
     {
         // parse the payload
-        $payload = json_decode($request->request->get('payload'), true);
+        $payload = json_decode((string)$request->request->get('payload'), true);
         if (!$payload && $request->headers->get('Content-Type') === 'application/json') {
             $payload = json_decode($request->getContent(), true);
         }
 
-        if (!$payload) {
+        if (!$payload || !is_array($payload)) {
             return new JsonResponse(['status' => 'error', 'message' => 'Missing payload parameter'], 406);
         }
 
@@ -132,7 +141,7 @@ class ApiController extends Controller
             $urlRegex = '{^(?:ssh://git@|https?://|git://|git@)?(?P<host>[a-z0-9.-]+)(?::[0-9]+/|[:/])(?P<path>[\w.-]+(?:/[\w.-]+?)*)(?:\.git|/)?$}i';
             $url = $payload['repository']['url'];
             $url = str_replace('https://api.github.com/repos', 'https://github.com', $url);
-            $remoteId = $payload['repository']['id'] ?? null;
+            $remoteId = isset($payload['repository']['id']) && (is_string($payload['repository']['id']) || is_int($payload['repository']['id'])) ? $payload['repository']['id'] : null;
         } elseif (isset($payload['repository']['links']['html']['href'])) { // bitbucket push event payload
             $urlRegex = '{^(?:https?://|git://|git@)?(?:api\.)?(?P<host>bitbucket\.org)[/:](?P<path>[\w.-]+/[\w.-]+?)(\.git)?/?$}i';
             $url = $payload['repository']['links']['html']['href'];
@@ -156,16 +165,15 @@ class ApiController extends Controller
      *     defaults={"_format" = "json"},
      *     methods={"PUT"}
      * )
-     * @ParamConverter("package", options={"mapping": {"package": "name"}})
      */
-    public function editPackageAction(Request $request, Package $package, ValidatorInterface $validator)
+    public function editPackageAction(Request $request, Package $package, ValidatorInterface $validator): JsonResponse
     {
         $user = $this->findUser($request);
-        if (!$package->getMaintainers()->contains($user) && !$this->isGranted('ROLE_EDIT_PACKAGES')) {
+        if ((!$user || !$package->getMaintainers()->contains($user)) && !$this->isGranted('ROLE_EDIT_PACKAGES')) {
             throw new AccessDeniedException;
         }
 
-        $payload = json_decode($request->request->get('payload'), true);
+        $payload = json_decode((string)$request->request->get('payload'), true);
         if (!$payload && $request->headers->get('Content-Type') === 'application/json') {
             $payload = json_decode($request->getContent(), true);
         }
@@ -193,7 +201,7 @@ class ApiController extends Controller
     /**
      * @Route("/jobs/{id}", name="get_job", requirements={"id"="[a-f0-9]+"}, defaults={"_format" = "json"}, methods={"GET"})
      */
-    public function getJobAction(string $id)
+    public function getJobAction(string $id): JsonResponse
     {
         return new JsonResponse($this->scheduler->getJobStatus($id), 200);
     }
@@ -212,7 +220,7 @@ class ApiController extends Controller
      *
      * @Route("/downloads/", name="track_download_batch", defaults={"_format" = "json"}, methods={"POST"})
      */
-    public function trackDownloadsAction(Request $request, StatsDClient $statsd, string $trustedIpHeader, DownloadManager $downloadManager, VersionIdCache $versionIdCache)
+    public function trackDownloadsAction(Request $request, StatsDClient $statsd, string $trustedIpHeader, DownloadManager $downloadManager, VersionIdCache $versionIdCache): JsonResponse
     {
         $contents = json_decode($request->getContent(), true);
         $invalidInputs = function ($item) {
@@ -260,24 +268,30 @@ class ApiController extends Controller
 
             $uaParser = new UserAgentParser($request->headers->get('User-Agent'));
             if ($uaParser->getComposerVersion() && $uaParser->getPhpMinorVersion() && $uaParser->getComposerMajorVersion()) {
-                $downloadManager->addDownloads($jobs, $ip, $uaParser->getPhpMinorVersion(), $uaParser->getPhpMinorPlatformVersion() ?: $uaParser->getPhpMinorVersion());
+                $downloadManager->addDownloads($jobs, $ip ?? '', $uaParser->getPhpMinorVersion(), $uaParser->getPhpMinorPlatformVersion() ?: $uaParser->getPhpMinorVersion());
 
                 $statsd->increment('installs', 1, 1, [
-                    'composer' => $uaParser->getComposerVersion() ?: 'unknown',
-                    'composer_major' => $uaParser->getComposerMajorVersion() ?: 'unknown',
-                    'php_minor' => $uaParser->getPhpMinorVersion() ?: 'unknown',
+                    'composer_major' => $uaParser->getComposerMajorVersion(),
+                    'php_minor' => $uaParser->getPhpMinorVersion(),
                     'platform_php_minor' => $uaParser->getPhpMinorPlatformVersion() ?: 'unknown',
-                    'php_patch' => $uaParser->getPhpVersion() ?: 'unknown',
-                    'http' => $uaParser->getHttpVersion() ?: 'unknown',
                     'ci' => $uaParser->getCI() ? 'true' : 'false',
+                ]);
+                $statsd->increment('installs.composer', 1, 1, [
+                    'composer' => $uaParser->getComposerVersion(),
+                ]);
+                $statsd->increment('installs.http', 1, 1, [
+                    'http' => $uaParser->getHttpVersion() ?: 'unknown',
+                ]);
+                $statsd->increment('installs.php_patch', 1, 1, [
+                    'php_patch' => $uaParser->getPhpVersion() ?: 'unknown',
                 ]);
             } elseif (
                 // log only if user-agent header is well-formed (it sometimes contains the header name itself in the value)
-                0 !== strpos($request->headers->get('User-Agent'), 'User-Agent:')
+                !str_starts_with($request->headers->get('User-Agent'), 'User-Agent:')
                 // and only if composer version or php minor are missing, if only composer major is invalid it's irrelevant
                 || !$uaParser->getComposerVersion() || !$uaParser->getPhpMinorVersion()
             ) {
-                $this->logger->error('Could not parse UA: '.$request->headers->get('User-Agent').' with '.$request->getContent().' from '.$request->getClientIp());
+                $this->logger->warning('Could not parse UA: '.$request->headers->get('User-Agent').' with '.$request->getContent().' from '.$request->getClientIp());
                 $statsd->increment('installs.invalid-ua');
             }
         }
@@ -291,32 +305,52 @@ class ApiController extends Controller
 
     private function extractMinorVersion(string $version): string
     {
-        return preg_replace('{^(\d+\.\d+).*}', '$1', $version);
+        return Preg::replace('{^(\d+\.\d+).*}', '$1', $version);
     }
 
     /**
      * @Route(
      *     "/api/security-advisories/",
-     *     name="api_security_adivosries",
+     *     name="api_security_advisories",
      *     defaults={"_format" = "json"},
      *     methods={"GET", "POST"}
      * )
      */
-    public function securityAdvisoryAction(Request $request): JsonResponse
+    public function securityAdvisoryAction(Request $request, ProviderManager $providerManager): JsonResponse
     {
-        $packageNames = array_filter((array) $request->get('packages'));
+        $packageNames = array_filter((array) $request->get('packages'), fn($name) => is_string($name) && $name !== '');
         if ((!$request->query->has('updatedSince') && !$request->get('packages')) || (!$packageNames && $request->get('packages'))) {
             return new JsonResponse(['status' => 'error', 'message' => 'Missing array of package names as the "packages" parameter'], 400);
         }
 
         $updatedSince = $request->query->getInt('updatedSince', 0);
 
-        /** @var array[] $advisories */
         $advisories = $this->getEM()->getRepository(SecurityAdvisory::class)->searchSecurityAdvisories($packageNames, $updatedSince);
-
         $response = ['advisories' => []];
         foreach ($advisories as $advisory) {
-            $response['advisories'][$advisory['packageName']][] = $advisory;
+            $source = [
+                'name' => $advisory['sourceSource'],
+                'remoteId' => $advisory['sourceRemoteId'],
+            ];
+            unset($advisory['sourceSource'], $advisory['sourceRemoteId']);
+            if (!isset($response['advisories'][$advisory['packageName']][$advisory['advisoryId']])) {
+                $advisory['sources'] = [];
+                $response['advisories'][$advisory['packageName']][$advisory['advisoryId']] = $advisory;
+            }
+
+            $response['advisories'][$advisory['packageName']][$advisory['advisoryId']]['sources'][] = $source;
+        }
+
+        // Ensure known packages are returned even if no advisory is present to ensure they do not get retried by composer in lower prio repos
+        // Do a max of 1000 packages to prevent abuse
+        foreach (array_slice($packageNames, 0, 1000) as $name) {
+            if ($providerManager->packageExists($name)) {
+                $response['advisories'][$name] ??= [];
+            }
+        }
+
+        foreach ($response['advisories'] as $packageName => $packageAdvisories) {
+            $response['advisories'][$packageName] = array_values($packageAdvisories);
         }
 
         return new JsonResponse($response, 200);
@@ -326,7 +360,7 @@ class ApiController extends Controller
      * @param string $name
      * @return array{id: int, vid: int}|false
      */
-    protected function getDefaultPackageAndVersionId($name)
+    protected function getDefaultPackageAndVersionId($name): array|false
     {
         /** @var array{id: string, vid: string}|false $result */
         $result = $this->getEM()->getConnection()->fetchAssociative(
@@ -349,16 +383,14 @@ class ApiController extends Controller
     /**
      * Perform the package update
      *
-     * @param Request $request the current request
      * @param string $url the repository's URL (deducted from the request)
-     * @param string $urlRegex the regex used to split the user packages into domain and path
-     * @return Response
+     * @param non-empty-string $urlRegex the regex used to split the user packages into domain and path
      */
-    protected function receivePost(Request $request, $url, $urlRegex, $remoteId, string $githubWebhookSecret)
+    protected function receivePost(Request $request, string $url, string $urlRegex, string|int|null $remoteId, string $githubWebhookSecret): JsonResponse
     {
         // try to parse the URL first to avoid the DB lookup on malformed requests
-        if (!preg_match($urlRegex, $url, $match)) {
-            return new Response(json_encode(['status' => 'error', 'message' => 'Could not parse payload repository URL']), 406);
+        if (!Preg::isMatch($urlRegex, $url, $match)) {
+            return new JsonResponse(['status' => 'error', 'message' => 'Could not parse payload repository URL'], 406);
         }
 
         if ($remoteId) {
@@ -379,11 +411,11 @@ class ApiController extends Controller
                 list($algo, $sig) = explode('=', $sig);
                 $expected = hash_hmac($algo, $request->getContent(), $user->getApiToken());
                 if (hash_equals($expected, $sig)) {
-                    $packages = $this->findPackagesByRepository('https://github.com/'.$match['path'], $remoteId, $user);
+                    $packages = $this->findPackagesByRepository('https://github.com/'.$match['path'], (string)$remoteId, $user);
                     $autoUpdated = Package::AUTO_GITHUB_HOOK;
                     $receiveType = 'github_user_secret';
                 } else {
-                    return new Response(json_encode(['status' => 'error', 'message' => 'Secret should be the Packagist API Token for the Packagist user "'.$username.'". Signature verification failed.']), 403);
+                    return new JsonResponse(['status' => 'error', 'message' => 'Secret should be the Packagist API Token for the Packagist user "'.$username.'". Signature verification failed.'], 403);
                 }
             } else {
                 $user = null;
@@ -401,7 +433,7 @@ class ApiController extends Controller
                 list($algo, $sig) = explode('=', $sig);
                 $expected = hash_hmac($algo, $request->getContent(), $githubWebhookSecret);
                 if (hash_equals($expected, $sig)) {
-                    $packages = $this->findPackagesByRepository('https://github.com/'.$match['path'], $remoteId);
+                    $packages = $this->findPackagesByRepository('https://github.com/'.$match['path'], (string)$remoteId);
                     $autoUpdated = Package::AUTO_GITHUB_HOOK;
                     $receiveType = 'github_auto';
                 }
@@ -410,7 +442,7 @@ class ApiController extends Controller
 
         if (!$packages) {
             if (!$user) {
-                return new Response(json_encode(['status' => 'error', 'message' => 'Invalid credentials']), 403);
+                return new JsonResponse(['status' => 'error', 'message' => 'Invalid credentials'], 403);
             }
 
             // try to find the user package
@@ -418,7 +450,7 @@ class ApiController extends Controller
         }
 
         if (!$packages) {
-            return new Response(json_encode(['status' => 'error', 'message' => 'Could not find a package that matches this request (does user maintain the package?)']), 404);
+            return new JsonResponse(['status' => 'error', 'message' => 'Could not find a package that matches this request (does user maintain the package?)'], 404);
         }
 
         $jobs = [];
@@ -438,11 +470,8 @@ class ApiController extends Controller
 
     /**
      * Find a user by his username and API token
-     *
-     * @param Request $request
-     * @return User|null the found user or null otherwise
      */
-    protected function findUser(Request $request)
+    protected function findUser(Request $request): ?User
     {
         $username = $request->request->has('username') ?
             $request->request->get('username') :
@@ -469,14 +498,12 @@ class ApiController extends Controller
     /**
      * Find a user package given by its full URL
      *
-     * @param User $user
-     * @param string $url
-     * @param string $urlRegex
-     * @return array the packages found
+     * @param non-empty-string $urlRegex
+     * @return list<Package>
      */
-    protected function findPackagesByUrl(User $user, $url, $urlRegex, $remoteId)
+    protected function findPackagesByUrl(User $user, string $url, string $urlRegex, string|int|null $remoteId): array
     {
-        if (!preg_match($urlRegex, $url, $matched)) {
+        if (!Preg::isMatch($urlRegex, $url, $matched)) {
             return [];
         }
 
@@ -485,14 +512,14 @@ class ApiController extends Controller
             if (
                 $url === 'https://packagist.org/packages/'.$package->getName()
                 || (
-                    preg_match($urlRegex, $package->getRepository(), $candidate)
+                    Preg::isMatch($urlRegex, $package->getRepository(), $candidate)
                     && strtolower($candidate['host']) === strtolower($matched['host'])
                     && strtolower($candidate['path']) === strtolower($matched['path'])
                 )
             ) {
                 $packages[] = $package;
-                if ($remoteId && !$package->getRemoteId()) {
-                    $package->setRemoteId($remoteId);
+                if (null !== $remoteId && '' !== $remoteId && !$package->getRemoteId()) {
+                    $package->setRemoteId((string) $remoteId);
                 }
             }
         }
@@ -502,9 +529,9 @@ class ApiController extends Controller
 
     /**
      * @param string $url
-     * @return array the packages found
+     * @return Package[] the packages found
      */
-    protected function findPackagesByRepository(string $url, $remoteId, User $user = null): array
+    protected function findPackagesByRepository(string $url, string $remoteId, User $user = null): array
     {
         $packageRepo = $this->getEM()->getRepository(Package::class);
         $packages = $packageRepo->findBy(['repository' => $url]);

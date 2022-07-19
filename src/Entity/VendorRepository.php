@@ -17,6 +17,7 @@ use Doctrine\Persistence\ManagerRegistry;
 
 /**
  * @author Jordi Boggiano <j.boggiano@seld.be>
+ * @extends ServiceEntityRepository<Vendor>
  */
 class VendorRepository extends ServiceEntityRepository
 {
@@ -27,12 +28,10 @@ class VendorRepository extends ServiceEntityRepository
 
     public function isVerified(string $vendor): bool
     {
-        $result = $this->getEntityManager()->getConnection()->fetchOne('SELECT verified FROM vendor WHERE name = :vendor', ['vendor' => $vendor]);
-
-        return $result === '1';
+        return (bool) $this->getEntityManager()->getConnection()->fetchOne('SELECT verified FROM vendor WHERE name = :vendor', ['vendor' => $vendor]);
     }
 
-    public function verify(string $vendor)
+    public function verify(string $vendor): void
     {
         $this->getEntityManager()->getConnection()->executeStatement(
             'INSERT INTO vendor (name, verified) VALUES (:vendor, 1) ON DUPLICATE KEY UPDATE verified=1',

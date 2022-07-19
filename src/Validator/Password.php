@@ -10,6 +10,9 @@ use Symfony\Component\Validator\Constraints as Assert;
  */
 class Password extends Compound
 {
+    /**
+     * @param array<string, mixed> $options
+     */
     protected function getConstraints(array $options): array
     {
         return [
@@ -23,7 +26,7 @@ class Password extends Compound
                 // max length allowed by Symfony for security reasons
                 'max' => 4096,
             ]),
-            new Assert\NotCompromisedPassword(),
+            new Assert\NotCompromisedPassword(skipOnError: true),
         ];
     }
 }

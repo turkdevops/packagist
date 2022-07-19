@@ -12,11 +12,14 @@
 
 namespace App\Entity;
 
+use Composer\Pcre\Preg;
 use Doctrine\Bundle\DoctrineBundle\Repository\ServiceEntityRepository;
+use Doctrine\ORM\QueryBuilder;
 use Doctrine\Persistence\ManagerRegistry;
 
 /**
  * @author Jordi Boggiano <j.boggiano@seld.be>
+ * @extends ServiceEntityRepository<User>
  */
 class UserRepository extends ServiceEntityRepository
 {
@@ -27,7 +30,7 @@ class UserRepository extends ServiceEntityRepository
 
     public function findOneByUsernameOrEmail(string $usernameOrEmail): ?User
     {
-        if (preg_match('/^.+\@\S+\.\S+$/', $usernameOrEmail)) {
+        if (Preg::isMatch('/^.+\@\S+\.\S+$/', $usernameOrEmail)) {
             $user = $this->findOneBy(['emailCanonical' => $usernameOrEmail]);
             if (null !== $user) {
                 return $user;
@@ -47,7 +50,7 @@ class UserRepository extends ServiceEntityRepository
         return $qb->getQuery()->getResult();
     }
 
-    public function getPackageMaintainersQueryBuilder(Package $package, User $excludeUser=null)
+    public function getPackageMaintainersQueryBuilder(Package $package, User $excludeUser=null): QueryBuilder
     {
         $qb = $this->createQueryBuilder('u')
             ->select('u')

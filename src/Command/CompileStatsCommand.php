@@ -12,6 +12,7 @@
 
 namespace App\Command;
 
+use Doctrine\DBAL\Connection;
 use Doctrine\Persistence\ManagerRegistry;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
@@ -39,7 +40,7 @@ class CompileStatsCommand extends Command
         parent::__construct();
     }
 
-    protected function configure()
+    protected function configure(): void
     {
         $this
             ->setName('packagist:stats:compile')
@@ -50,7 +51,7 @@ class CompileStatsCommand extends Command
 
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
-        $lockAcquired = $this->locker->lockCommand($this->getName());
+        $lockAcquired = $this->locker->lockCommand(__CLASS__);
         if (!$lockAcquired) {
             if ($input->getOption('verbose')) {
                 $output->writeln('Aborting, another task is running already');
@@ -88,15 +89,15 @@ class CompileStatsCommand extends Command
         $this->redis->rename('downloads:trending:new', 'downloads:trending');
         $this->redis->rename('downloads:absolute:new', 'downloads:absolute');
 
-        $this->locker->unlockCommand($this->getName());
+        $this->locker->unlockCommand(__CLASS__);
 
         return 0;
     }
 
-    protected function sumLastNDays($days, $id, \DateTime $yesterday, $conn)
+    protected function sumLastNDays(int $days, int $id, \DateTime $yesterday, Connection $conn): int
     {
         $date = clone $yesterday;
-        $row = $conn->fetchAssoc('SELECT data FROM download WHERE id = :id AND type = :type', ['id' => $id, 'type' => Download::TYPE_PACKAGE]);
+        $row = $conn->fetchAssociative('SELECT data FROM download WHERE id = :id AND type = :type', ['id' => $id, 'type' => Download::TYPE_PACKAGE]);
         if (!$row) {
             return 0;
         }

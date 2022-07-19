@@ -12,13 +12,16 @@
 
 namespace App\Entity;
 
+use DateTimeImmutable;
 use Doctrine\ORM\QueryBuilder;
+use Doctrine\ORM\Query;
 use Doctrine\DBAL\Cache\QueryCacheProfile;
 use Doctrine\Bundle\DoctrineBundle\Repository\ServiceEntityRepository;
 use Doctrine\Persistence\ManagerRegistry;
 
 /**
  * @author Jordi Boggiano <j.boggiano@seld.be>
+ * @extends ServiceEntityRepository<Package>
  */
 class PackageRepository extends ServiceEntityRepository
 {
@@ -27,7 +30,10 @@ class PackageRepository extends ServiceEntityRepository
         parent::__construct($registry, Package::class);
     }
 
-    public function findProviders($name)
+    /**
+     * @return array<Package>
+     */
+    public function findProviders($name): array
     {
         $query = $this->createQueryBuilder('p')
             ->select('p')
@@ -42,7 +48,10 @@ class PackageRepository extends ServiceEntityRepository
         return $query->getResult();
     }
 
-    public function getPackageNamesUpdatedSince(\DateTimeInterface $date)
+    /**
+     * @return array<string>
+     */
+    public function getPackageNamesUpdatedSince(\DateTimeInterface $date): array
     {
         $query = $this->getEntityManager()
             ->createQuery("
@@ -56,7 +65,10 @@ class PackageRepository extends ServiceEntityRepository
         return array_map('strtolower', $names);
     }
 
-    public function getPackageNames()
+    /**
+     * @return array<string>
+     */
+    public function getPackageNames(): array
     {
         $query = $this->getEntityManager()
             ->createQuery("SELECT p.name FROM App\Entity\Package p WHERE p.replacementPackage IS NULL OR p.replacementPackage != 'spam/spam'");
@@ -66,7 +78,10 @@ class PackageRepository extends ServiceEntityRepository
         return array_map('strtolower', $names);
     }
 
-    public function getProvidedNames()
+    /**
+     * @return array<string>
+     */
+    public function getProvidedNames(): array
     {
         $query = $this->getEntityManager()
             ->createQuery("SELECT p.packageName AS name
@@ -80,7 +95,10 @@ class PackageRepository extends ServiceEntityRepository
         return array_map('strtolower', $names);
     }
 
-    public function getPackageNamesByType($type)
+    /**
+     * @return array<string>
+     */
+    public function getPackageNamesByType($type): array
     {
         $query = $this->getEntityManager()
             ->createQuery("SELECT p.name FROM App\Entity\Package p WHERE p.type = :type AND (p.replacementPackage IS NULL OR p.replacementPackage != 'spam/spam')")
@@ -89,7 +107,10 @@ class PackageRepository extends ServiceEntityRepository
         return $this->getPackageNamesForQuery($query);
     }
 
-    public function getPackageNamesByVendor($vendor)
+    /**
+     * @return array<string>
+     */
+    public function getPackageNamesByVendor($vendor): array
     {
         $query = $this->getEntityManager()
             ->createQuery("SELECT p.name FROM App\Entity\Package p WHERE p.name LIKE :vendor AND (p.replacementPackage IS NULL OR p.replacementPackage != 'spam/spam')")
@@ -98,7 +119,10 @@ class PackageRepository extends ServiceEntityRepository
         return $this->getPackageNamesForQuery($query);
     }
 
-    public function getGitHubPackagesByMaintainer(int $userId)
+    /**
+     * @return array<Package>
+     */
+    public function getGitHubPackagesByMaintainer(int $userId): array
     {
         $query = $this->createQueryBuilder('p')
             ->select('p')
@@ -125,7 +149,12 @@ class PackageRepository extends ServiceEntityRepository
         return (bool) $query->getOneOrNullResult();
     }
 
-    public function getPackagesWithFields($filters, $fields)
+    /**
+     * @param array<string, string|int|bool> $filters
+     * @param array<string> $fields
+     * @return array<array<string, string|int|bool>>
+     */
+    public function getPackagesWithFields(array $filters, array $fields): array
     {
         $selector = '';
         foreach ($fields as $field) {
@@ -165,10 +194,16 @@ class PackageRepository extends ServiceEntityRepository
         return $result;
     }
 
-    private function getPackageNamesForQuery($query)
+    /**
+     * @return list<string>
+     */
+    private function getPackageNamesForQuery(Query $query): array
     {
         $names = [];
         foreach ($query->getScalarResult() as $row) {
+            if (!is_array($row) || !isset($row['name']) || !is_string($row['name'])) {
+                throw new \LogicException('Excepted rows with a name field, got '.json_encode($row));
+            }
             $names[] = $row['name'];
         }
 
@@ -207,14 +242,20 @@ class PackageRepository extends ServiceEntityRepository
         );
     }
 
-    public function getStalePackagesForIndexing()
+    /**
+     * @return list<array{id: string}>
+     */
+    public function getStalePackagesForIndexing(): array
     {
         $conn = $this->getEntityManager()->getConnection();
 
         return $conn->fetchAllAssociative('SELECT p.id FROM package p WHERE p.indexedAt IS NULL OR p.indexedAt <= p.crawledAt ORDER BY p.id ASC');
     }
 
-    public function getStalePackagesForDumping()
+    /**
+     * @return list<string>
+     */
+    public function getStalePackagesForDumping(): array
     {
         $conn = $this->getEntityManager()->getConnection();
 
@@ -241,14 +282,20 @@ class PackageRepository extends ServiceEntityRepository
         ', ['id' => $package->getId(), 'date' => date('Y-m-d H:i:s', strtotime('-4months'))]);
     }
 
-    public function getStalePackagesForDumpingV2()
+    /**
+     * @return list<string>
+     */
+    public function getStalePackagesForDumpingV2(): array
     {
         $conn = $this->getEntityManager()->getConnection();
 
-        return $conn->fetchFirstColumn('SELECT p.id FROM package p WHERE p.dumpedAtV2 IS NULL OR (p.dumpedAtV2 <= p.crawledAt AND p.crawledAt < NOW()) ORDER BY p.id ASC');
+        return $conn->fetchFirstColumn('SELECT p.id FROM package p WHERE p.dumpedAtV2 IS NULL OR (p.dumpedAtV2 <= p.crawledAt AND p.crawledAt < NOW())');
     }
 
-    public function iterateStaleDownloadCountPackageIds()
+    /**
+     * @return iterable<array{id: int, lastUpdated: DateTimeImmutable}>
+     */
+    public function iterateStaleDownloadCountPackageIds(): iterable
     {
         $qb = $this->createQueryBuilder('p');
         $res = $qb
@@ -260,7 +307,7 @@ class PackageRepository extends ServiceEntityRepository
             ->getResult();
 
         foreach ($res as $row) {
-            yield ['id' => $row['id'], 'lastUpdated' => is_null($row['lastUpdated']) ? new \DateTimeImmutable($row['createdAt']->format('r')) : new \DateTimeImmutable($row['lastUpdated']->format('r'))];
+            yield ['id' => (int) $row['id'], 'lastUpdated' => is_null($row['lastUpdated']) ? new \DateTimeImmutable($row['createdAt']->format('r')) : new \DateTimeImmutable($row['lastUpdated']->format('r'))];
         }
     }
 
@@ -273,10 +320,9 @@ class PackageRepository extends ServiceEntityRepository
         // this helps for packages like https://packagist.org/packages/ccxt/ccxt
         // with huge amounts of versions
         $qb = $this->getEntityManager()->createQueryBuilder();
-        $qb->select('partial p.{id}', 'partial v.{id, version, normalizedVersion, development, releasedAt, extra, isDefaultBranch}', 'partial m.{id, username, email}')
+        $qb->select('partial p.{id}', 'partial v.{id, version, normalizedVersion, development, releasedAt, extra, isDefaultBranch}')
             ->from('App\Entity\Package', 'p')
             ->leftJoin('p.versions', 'v')
-            ->leftJoin('p.maintainers', 'm')
             ->orderBy('v.development', 'DESC')
             ->addOrderBy('v.releasedAt', 'DESC')
             ->where('p.name = ?0')
@@ -284,20 +330,15 @@ class PackageRepository extends ServiceEntityRepository
 
         $pkg = $qb->getQuery()->getSingleResult();
 
-        if ($pkg) {
-            // then refresh the package to complete its data and inject the previously fetched versions/maintainers to
-            // get a complete package
+        if ($pkg instanceof Package) {
+            // then refresh the package to complete its data and inject the previously
+            // fetched partial versions to get a complete package
             $versions = $pkg->getVersions();
-            $maintainers = $pkg->getMaintainers();
             $this->getEntityManager()->refresh($pkg);
 
             $prop = new \ReflectionProperty($pkg, 'versions');
             $prop->setAccessible(true);
             $prop->setValue($pkg, $versions);
-
-            $prop = new \ReflectionProperty($pkg, 'maintainers');
-            $prop->setAccessible(true);
-            $prop->setValue($pkg, $maintainers);
         }
 
         return $pkg;
@@ -307,7 +348,7 @@ class PackageRepository extends ServiceEntityRepository
     {
         $qb = $this->getEntityManager()->createQueryBuilder();
         $qb->select('p', 'm')
-            ->from('App\Entity\Package', 'p')
+            ->from(Package::class, 'p')
             ->leftJoin('p.maintainers', 'm')
             ->where('p.name = ?0')
             ->setParameters([$name]);
@@ -316,13 +357,15 @@ class PackageRepository extends ServiceEntityRepository
     }
 
     /**
+     * @param list<int>|null $ids
+     * @param array<string, string|int|null> $filters
      * @return Package[]
      */
-    public function getPackagesWithVersions(array $ids = null, $filters = [])
+    public function getPackagesWithVersions(array $ids = null, array $filters = []): array
     {
         $qb = $this->getEntityManager()->createQueryBuilder();
         $qb->select('p', 'v')
-            ->from('App\Entity\Package', 'p')
+            ->from(Package::class, 'p')
             ->leftJoin('p.versions', 'v')
             ->orderBy('v.development', 'DESC')
             ->addOrderBy('v.releasedAt', 'DESC');
@@ -337,22 +380,29 @@ class PackageRepository extends ServiceEntityRepository
         return $qb->getQuery()->getResult();
     }
 
-    public function getGitHubStars(array $ids)
+    /**
+     * @param int[] $ids
+     * @return array<array{gitHubStars: int|null, id: int}>
+     */
+    public function getGitHubStars(array $ids): array
     {
         $qb = $this->getEntityManager()->createQueryBuilder();
         $qb->select('p.gitHubStars', 'p.id')
-            ->from('App\Entity\Package', 'p')
+            ->from(Package::class, 'p')
             ->where($qb->expr()->in('p.id', ':ids'))
             ->setParameter('ids', $ids);
 
         return $qb->getQuery()->getResult();
     }
 
-    public function getFilteredQueryBuilder(array $filters = [], $orderByName = false): QueryBuilder
+    /**
+     * @param array<string, string|int|null> $filters
+     */
+    public function getFilteredQueryBuilder(array $filters = [], bool $orderByName = false): QueryBuilder
     {
         $qb = $this->getEntityManager()->createQueryBuilder();
         $qb->select('p')
-            ->from('App\Entity\Package', 'p');
+            ->from(Package::class, 'p');
 
         if (isset($filters['tag'])) {
             $qb->leftJoin('p.versions', 'v');
@@ -373,7 +423,7 @@ class PackageRepository extends ServiceEntityRepository
         return $qb;
     }
 
-    public function isVendorTaken($vendor, User $user): bool
+    public function isVendorTaken(string $vendor, User $user = null): bool
     {
         $query = $this->getEntityManager()
             ->createQuery(
@@ -388,9 +438,11 @@ class PackageRepository extends ServiceEntityRepository
             return false;
         }
 
-        foreach ($rows as $row) {
-            if ($row['user_id'] === $user->getId()) {
-                return false;
+        if ($user instanceof User) {
+            foreach ($rows as $row) {
+                if ($row['user_id'] === $user->getId()) {
+                    return false;
+                }
             }
         }
 
@@ -403,6 +455,9 @@ class PackageRepository extends ServiceEntityRepository
         $this->getEntityManager()->getConnection()->executeStatement($sql, ['suspect' => $package->getSuspect(), 'id' => $package->getId()]);
     }
 
+    /**
+     * @return int<0, max>
+     */
     public function getSuspectPackageCount(): int
     {
         $sql = 'SELECT COUNT(*) count FROM package p WHERE p.suspect IS NOT NULL AND (p.replacementPackage IS NULL OR p.replacementPackage != "spam/spam")';
@@ -421,6 +476,7 @@ class PackageRepository extends ServiceEntityRepository
     /**
      * @param string   $name Package name to find the dependents of
      * @param int|null $type One of Dependent::TYPE_*
+     * @return int<0, max>
      */
     public function getDependentCount(string $name, ?int $type = null): int
     {
@@ -437,8 +493,9 @@ class PackageRepository extends ServiceEntityRepository
     /**
      * @param string   $name Package name to find the dependents of
      * @param int|null $type One of Dependent::TYPE_*
+     * @return array<array{id: int, name: string, description: string|null, language: string|null, abandoned: int, replacementPackage: string|null}>
      */
-    public function getDependents(string $name, int $offset = 0, int $limit = 15, string $orderBy = 'name', ?int $type = null)
+    public function getDependents(string $name, int $offset = 0, int $limit = 15, string $orderBy = 'name', ?int $type = null): array
     {
         $orderByField = 'p.name ASC';
         $join = '';
@@ -461,10 +518,15 @@ class PackageRepository extends ServiceEntityRepository
                 SELECT DISTINCT package_id FROM dependent WHERE packageName = :name'.$typeFilter.'
             ) x ON x.package_id = p.id '.$join.' ORDER BY '.$orderByField.' LIMIT '.((int)$limit).' OFFSET '.((int)$offset);
 
-        return $this->getEntityManager()->getConnection()->fetchAllAssociative($sql, $args);
+        $res = [];
+        foreach ($this->getEntityManager()->getConnection()->fetchAllAssociative($sql, $args) as $row) {
+            $res[] = ['id' => (int) $row['id'], 'abandoned' => (int) $row['abandoned']] + $row;
+        }
+
+        return $res;
     }
 
-    public function getSuggestCount($name): int
+    public function getSuggestCount(string $name): int
     {
         $sql = 'SELECT COUNT(*) count FROM suggester WHERE packageName = :name';
         $args = ['name' => $name];
@@ -472,14 +534,22 @@ class PackageRepository extends ServiceEntityRepository
         return (int) $this->getEntityManager()->getConnection()->fetchOne($sql, $args);
     }
 
-    public function getSuggests($name, $offset = 0, $limit = 15)
+    /**
+     * @return array<array{id: int, name: string, description: string|null, language: string|null, abandoned: int, replacementPackage: string|null}>
+     */
+    public function getSuggests(string $name, int $offset = 0, int $limit = 15): array
     {
         $sql = 'SELECT p.id, p.name, p.description, p.language, p.abandoned, p.replacementPackage
             FROM package p INNER JOIN (
                 SELECT DISTINCT package_id FROM suggester WHERE packageName = :name
             ) x ON x.package_id = p.id ORDER BY p.name ASC LIMIT '.((int)$limit).' OFFSET '.((int)$offset);
 
-        return $this->getEntityManager()->getConnection()->fetchAllAssociative($sql, ['name' => $name]);
+        $res = [];
+        foreach ($this->getEntityManager()->getConnection()->fetchAllAssociative($sql, ['name' => $name]) as $row) {
+            $res[] = ['id' => (int) $row['id'], 'abandoned' => (int) $row['abandoned']] + $row;
+        }
+
+        return $res;
     }
 
     public function getTotal(): int
@@ -517,7 +587,10 @@ class PackageRepository extends ServiceEntityRepository
         return $result;
     }
 
-    private function addFilters(QueryBuilder $qb, array $filters)
+    /**
+     * @param array<string, string|int|null> $filters
+     */
+    private function addFilters(QueryBuilder $qb, array $filters): void
     {
         foreach ($filters as $name => $value) {
             if (null === $value) {
@@ -552,7 +625,7 @@ class PackageRepository extends ServiceEntityRepository
      *
      * @return QueryBuilder
      */
-    public function getQueryBuilderForNewestPackages()
+    public function getQueryBuilderForNewestPackages(): QueryBuilder
     {
         $qb = $this->getEntityManager()->createQueryBuilder();
         $qb->select('p')

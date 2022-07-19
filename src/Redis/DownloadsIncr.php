@@ -4,25 +4,32 @@ namespace App\Redis;
 
 class DownloadsIncr extends \Predis\Command\ScriptCommand
 {
-    private $args;
+    /**
+     * @var array<string|int>
+     */
+    private array $args;
 
-    public function getKeysCount()
+    public function getKeysCount(): int
     {
         if (!$this->args) {
             throw new \LogicException('getKeysCount called before filterArguments');
         }
 
-        return count($this->args) - 3;
+        return count($this->args) - 4;
     }
 
-    protected function filterArguments(array $arguments)
+    /**
+     * @param  array<string|int> $arguments
+     * @return array<string|int>
+     */
+    protected function filterArguments(array $arguments): array
     {
         $this->args = $arguments;
 
         return parent::filterArguments($arguments);
     }
 
-    public function getScript()
+    public function getScript(): string
     {
         return <<<LUA
 local doIncr = false;
@@ -33,7 +40,7 @@ for i, key in ipairs(KEYS) do
     elseif ((i - 6) % 6) == 0 then
         local requests = tonumber(redis.call("ZINCRBY", key, 1, ARGV[1]));
         if 1 == requests then
-            redis.call("EXPIRE", key, 86400);
+            redis.call("PEXPIREAT", key, tonumber(ARGV[4]));
         end
 
         doIncr = false;

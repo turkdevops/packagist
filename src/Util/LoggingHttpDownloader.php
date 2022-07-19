@@ -4,8 +4,10 @@ namespace App\Util;
 
 use Composer\Config;
 use Composer\IO\IOInterface;
+use Composer\Util\Http\Response;
 use Composer\Util\HttpDownloader;
 use Graze\DogStatsD\Client as StatsDClient;
+use React\Promise\PromiseInterface;
 
 class LoggingHttpDownloader extends HttpDownloader
 {
@@ -19,28 +21,28 @@ class LoggingHttpDownloader extends HttpDownloader
         parent::__construct($io, $config);
     }
 
-    public function get($url, $options = array())
+    public function get($url, $options = array()): Response
     {
         $this->track($url);
 
         return parent::get($url, $options);
     }
 
-    public function add($url, $options = array())
+    public function add($url, $options = array()): PromiseInterface
     {
         $this->track($url);
 
         return parent::add($url, $options);
     }
 
-    public function copy($url, $to, $options = array())
+    public function copy($url, $to, $options = array()): Response
     {
         $this->track($url);
 
         return parent::copy($url, $to, $options);
     }
 
-    public function addCopy($url, $to, $options = array())
+    public function addCopy($url, $to, $options = array()): PromiseInterface
     {
         $this->track($url);
 
@@ -53,9 +55,14 @@ class LoggingHttpDownloader extends HttpDownloader
             return;
         }
 
-        $this->statsd->increment('github_api_request', tags: [
-            'vendor' => $this->vendor,
+        $tags = [
             'uses_packagist_token' => $this->usesPackagistToken ? '1' : '0',
-        ]);
+        ];
+
+        if ($this->usesPackagistToken) {
+            $tags['vendor'] = $this->vendor;
+        }
+
+        $this->statsd->increment('github_api_request', tags: $tags);
     }
 }

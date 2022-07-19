@@ -2,6 +2,8 @@
 
 namespace App\Service;
 
+use App\EventListener\SecurityAdvisoryUpdateListener;
+use App\SecurityAdvisory\SecurityAdvisoryResolver;
 use Composer\Console\HtmlOutputFormatter;
 use Composer\Factory;
 use Composer\IO\BufferIO;
@@ -15,66 +17,61 @@ use Symfony\Component\Console\Output\OutputInterface;
 
 class SecurityAdvisoryWorker
 {
-    private Locker $locker;
+    private const ADVISORY_WORKER_RUN = 'run';
 
-    private LoggerInterface $logger;
-
-    private ManagerRegistry $doctrine;
-
-    /** @var SecurityAdvisorySourceInterface[] */
-    private array $sources;
-
-    public function __construct(Locker $locker, LoggerInterface $logger, ManagerRegistry $doctrine, array $sources)
-    {
-        $this->locker = $locker;
-        $this->sources = $sources;
-        $this->logger = $logger;
-        $this->doctrine = $doctrine;
+    /**
+     * @param SecurityAdvisorySourceInterface[] $sources
+     */
+    public function __construct(
+        private Locker $locker,
+        private LoggerInterface $logger,
+        private ManagerRegistry $doctrine,
+        private array $sources,
+        private SecurityAdvisoryResolver $securityAdvisoryResolver,
+        private SecurityAdvisoryUpdateListener $advisoryUpdateListener,
+    ) {
     }
 
+    /**
+     * @return array{status: Job::STATUS_*, after?: \DateTime, message?: string, details?: string}
+     */
     public function process(Job $job, SignalHandler $signal): array
     {
         $sourceName = $job->getPayload()['source'];
-        $lockAcquired = $this->locker->lockSecurityAdvisory($sourceName);
+
+        $lockAcquired = $this->locker->lockSecurityAdvisory(self::ADVISORY_WORKER_RUN);
         if (!$lockAcquired) {
-            return ['status' => Job::STATUS_RESCHEDULE, 'after' => new \DateTime('+5 minutes')];
+            return ['status' => Job::STATUS_RESCHEDULE, 'after' => new \DateTime('+2 minutes')];
         }
 
         $io = new BufferIO('', OutputInterface::VERBOSITY_VERY_VERBOSE, new HtmlOutputFormatter(Factory::createAdditionalStyles()));
 
-        /** @var SecurityAdvisorySourceInterface $source */
         $source = $this->sources[$sourceName];
         $remoteAdvisories = $source->getAdvisories($io);
         if (null === $remoteAdvisories) {
-            $this->logger->info('Security advisory update failed, skipping', ['source' => $source]);
+            $this->logger->info('Security advisory update failed, skipping', ['source' => $sourceName]);
 
             return ['status' => Job::STATUS_ERRORED, 'message' => 'Security advisory update failed, skipped'];
         }
 
-        /** @var SecurityAdvisory[] $existingAdvisoryMap */
-        $existingAdvisoryMap = [];
         /** @var SecurityAdvisory[] $existingAdvisories */
-        $existingAdvisories = $this->doctrine->getRepository(SecurityAdvisory::class)->findBy(['source' => $sourceName]);
-        foreach ($existingAdvisories as $advisory) {
-            $existingAdvisoryMap[$advisory->getRemoteId()] = $advisory;
+        $existingAdvisories = $this->doctrine->getRepository(SecurityAdvisory::class)->getPackageAdvisoriesWithSources($remoteAdvisories->getPackageNames(), $sourceName);
+
+        [$new, $removed] = $this->securityAdvisoryResolver->resolve($existingAdvisories, $remoteAdvisories, $sourceName);
+
+        foreach ($new as $advisory) {
+            $this->doctrine->getManager()->persist($advisory);
         }
 
-        foreach ($remoteAdvisories as $remoteAdvisory) {
-            if (isset($existingAdvisoryMap[$remoteAdvisory->getId()])) {
-                $existingAdvisoryMap[$remoteAdvisory->getId()]->updateAdvisory($remoteAdvisory);
-                unset($existingAdvisoryMap[$remoteAdvisory->getId()]);
-            } else {
-                $this->doctrine->getManager()->persist(new SecurityAdvisory($remoteAdvisory, $sourceName));
-            }
-        }
-
-        foreach ($existingAdvisoryMap as $advisory) {
+        foreach ($removed as $advisory) {
             $this->doctrine->getManager()->remove($advisory);
         }
 
         $this->doctrine->getManager()->flush();
 
-        $this->locker->unlockSecurityAdvisory($sourceName);
+        $this->advisoryUpdateListener->flushChangesToPackages();
+
+        $this->locker->unlockSecurityAdvisory(self::ADVISORY_WORKER_RUN);
 
         return [
             'status' => Job::STATUS_COMPLETED,

@@ -6,7 +6,7 @@ on:
 
 env:
   COMPOSER_FLAGS: "--ansi --no-interaction --no-progress --prefer-dist"
-  APP_ENV: test
+  APP_ENV: dev
 
 jobs:
   tests:
@@ -25,6 +25,7 @@ jobs:
           extensions: "intl, zip, apcu"
           php-version: "8.0"
           tools: composer
+          ini-values: apc.enable_cli=1
 
       - name: Get composer cache directory
         id: composercache
@@ -37,8 +38,18 @@ jobs:
           key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.json') }}
           restore-keys: ${{ runner.os }}-composer-
 
-      - name: "Install latest dependencies"
+      - name: "Start MySQL"
+        run: |
+          sudo systemctl start mysql.service
+          echo 'DATABASE_URL="mysql://root:root@127.0.0.1:3306/packagist?serverVersion=8.0"' > .env.dev.local
+
+      - name: "Install dependencies"
         run: "composer install ${{ env.COMPOSER_FLAGS }}"
+
+      - name: "Setup DB"
+        run: |
+          bin/console doctrine:database:create -n
+          bin/console doctrine:schema:create -n
 
       - name: Run PHPStan
         run: composer phpstan

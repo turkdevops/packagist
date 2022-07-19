@@ -15,7 +15,6 @@ namespace App\Controller;
 use Doctrine\ORM\QueryBuilder;
 use App\Entity\Package;
 use App\Entity\Version;
-use Sensio\Bundle\FrameworkExtraBundle\Configuration\Template;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\Routing\Annotation\Route;
@@ -33,11 +32,10 @@ class FeedController extends Controller
 {
     /**
      * @Route("/", name="feeds")
-     * @Template
      */
-    public function feedsAction()
+    public function feedsAction(): Response
     {
-        return [];
+        return $this->render('feed/feeds.html.twig');
     }
 
     /**
@@ -144,7 +142,7 @@ class FeedController extends Controller
         $response = $this->buildResponse($req, $feed);
 
         $first = reset($packages);
-        if (false !== $first) {
+        if ($first instanceof Version && $first->getReleasedAt()) {
             $response->setDate($first->getReleasedAt());
         }
 
@@ -153,10 +151,9 @@ class FeedController extends Controller
 
     /**
      * Limits a query to the desired number of results
-     *
-     * @return array|\Traversable
+     * @return iterable<Package>|iterable<Version>
      */
-    protected function getLimitedResults(QueryBuilder $queryBuilder)
+    protected function getLimitedResults(QueryBuilder $queryBuilder): iterable
     {
         $query = $queryBuilder
             ->getQuery()
@@ -168,9 +165,9 @@ class FeedController extends Controller
     /**
      * Builds the desired feed
      *
-     * @param list<Package|Version> $items
+     * @param iterable<Package|Version> $items
      */
-    protected function buildFeed(Request $req, string $title, string $description, string $url, array $items): Feed
+    protected function buildFeed(Request $req, string $title, string $description, string $url, iterable $items): Feed
     {
         $feed = new Feed();
         $feed->setTitle($title);
@@ -184,7 +181,7 @@ class FeedController extends Controller
             $feed->addEntry($entry);
         }
 
-        if ($req->getRequestFormat() == 'atom') {
+        if ($req->getRequestFormat() === 'atom') {
             $feed->setFeedLink(
                 $req->getUri(),
                 $req->getRequestFormat()
@@ -248,7 +245,7 @@ class FeedController extends Controller
         $entry->setDateModified($version->getReleasedAt());
         $entry->setDateCreated($version->getReleasedAt());
 
-        foreach ($version->getAuthorData() as $author) {
+        foreach ($version->getAuthors() as $author) {
             if (!empty($author['name'])) {
                 $entry->addAuthor([
                     'name' => $author['name']
@@ -262,7 +259,13 @@ class FeedController extends Controller
      */
     protected function buildResponse(Request $req, Feed $feed): Response
     {
-        $content = $feed->export($req->getRequestFormat());
+        $format = $req->getRequestFormat();
+
+        if (null === $format) {
+            throw new \RuntimeException('Request format is not set.');
+        }
+
+        $content = $feed->export($format);
 
         $response = new Response($content, 200);
         $response->setSharedMaxAge(3600);

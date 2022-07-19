@@ -71,4 +71,39 @@ class RemoteSecurityAdvisoryTest extends TestCase
 
         $this->assertSame('2019-10-08 00:00:00', $advisory->getDate()->format('Y-m-d H:i:s'));
     }
+
+    public function testCreateFromFriendsOfPhpCVEXXXX(): void
+    {
+        $advisory = RemoteSecurityAdvisory::createFromFriendsOfPhp('symfony/framework-bundle/CVE-2022-xxxx.yaml', [
+            'title' => 'CVE-2022-xxxx: CSRF token missing in forms',
+            'link' => 'https://symfony.com/cve-2022-xxxx',
+            'cve' => 'CVE-2022-xxxx',
+            'branches' => [
+                '5.3.x' => [
+                    'time' => '2022-01-29 12:00:00',
+                    'versions' => ['>=5.3.14', '<=5.3.14'],
+                ],
+                '5.4.x' => [
+                    'time' => '2022-01-29 12:00:00',
+                    'versions' => ['>=5.4.3', '<=5.4.3'],
+                ],
+                '6.0.x' => [
+                    'time' => '2022-01-29 12:00:00',
+                    'versions' => ['>=6.0.3', '<=6.0.3'],
+                ],
+            ],
+            'reference' => 'composer://symfony/framework-bundle'
+        ]);
+
+        $this->assertSame('symfony/framework-bundle/CVE-2022-xxxx.yaml', $advisory->getId());
+        $this->assertNull($advisory->getCve());
+    }
+
+    public function testWithAddedAffectedVersion(): void
+    {
+        $advisory = new RemoteSecurityAdvisory('id', 'foobar', 'foo/bar', '>=1', 'https://foobar.com', null, new \DateTimeImmutable(), null, [], 'test');
+        $advisory = $advisory->withAddedAffectedVersion('<2');
+
+        $this->assertSame('>=1|<2', $advisory->getAffectedVersions());
+    }
 }

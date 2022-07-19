@@ -16,6 +16,7 @@ use Algolia\AlgoliaSearch\SearchClient;
 use App\Entity\Package;
 use App\Model\DownloadManager;
 use App\Model\FavoriteManager;
+use Composer\Pcre\Preg;
 use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
@@ -52,7 +53,7 @@ class IndexPackagesCommand extends Command
         parent::__construct();
     }
 
-    protected function configure()
+    protected function configure(): void
     {
         $this
             ->setName('packagist:index')
@@ -80,7 +81,7 @@ class IndexPackagesCommand extends Command
             return 0;
         }
 
-        $lockAcquired = $this->locker->lockCommand($this->getName());
+        $lockAcquired = $this->locker->lockCommand(__CLASS__);
         if (!$lockAcquired) {
             if ($input->getOption('verbose')) {
                 $output->writeln('Aborting, another task is running already');
@@ -91,10 +92,17 @@ class IndexPackagesCommand extends Command
         $index = $this->algolia->initIndex($this->algoliaIndexName);
 
         if ($package) {
-            $packages = [['id' => $this->getEM()->getRepository(Package::class)->findOneBy(['name' => $package])->getId()]];
+            $packageEntity = $this->getEM()->getRepository(Package::class)->findOneBy(['name' => $package]);
+            if ($packageEntity === null) {
+                $output->writeln('<error>Package '.$package.' not found</error>');
+                return 1;
+            }
+            $packages = [['id' => $packageEntity->getId()]];
         } elseif ($force || $indexAll) {
             $packages = $this->getEM()->getConnection()->fetchAllAssociative('SELECT id FROM package ORDER BY id ASC');
-            $this->getEM()->getConnection()->executeQuery('UPDATE package SET indexedAt = NULL');
+            if ($force) {
+                $this->getEM()->getConnection()->executeQuery('UPDATE package SET indexedAt = NULL');
+            }
         } else {
             $packages = $this->getEM()->getRepository(Package::class)->getStalePackagesForIndexing();
         }
@@ -128,7 +136,7 @@ class IndexPackagesCommand extends Command
             foreach ($packages as $package) {
                 $current++;
                 if ($verbose) {
-                    $output->writeln('['.sprintf('%'.strlen($total).'d', $current).'/'.$total.'] Indexing '.$package->getName());
+                    $output->writeln('['.sprintf('%'.strlen((string)$total).'d', $current).'/'.$total.'] Indexing '.$package->getName());
                 }
 
                 // delete spam packages from the search index
@@ -176,19 +184,23 @@ class IndexPackagesCommand extends Command
             $this->updateIndexedAt($idsToUpdate, $indexTime->format('Y-m-d H:i:s'));
         }
 
-        $this->locker->unlockCommand($this->getName());
+        $this->locker->unlockCommand(__CLASS__);
 
         return 0;
     }
 
-    private function packageToSearchableArray(Package $package, array $tags)
+    /**
+     * @param string[] $tags
+     * @return array<string, int|string|float|null|array<string, string|int>>
+     */
+    private function packageToSearchableArray(Package $package, array $tags): array
     {
         $faversCount = $this->favoriteManager->getFaverCount($package);
         $downloads = $this->downloadManager->getDownloads($package);
         $downloadsLog = $downloads['monthly'] > 0 ? log($downloads['monthly'], 10) : 0;
         $starsLog = $package->getGitHubStars() > 0 ? log($package->getGitHubStars(), 10) : 0;
         $popularity = round($downloadsLog + $starsLog);
-        $trendiness = $this->redis->zscore('downloads:trending', $package->getId());
+        $trendiness = (float)$this->redis->zscore('downloads:trending', $package->getId());
 
         $record = [
             'id' => $package->getId(),
@@ -196,7 +208,7 @@ class IndexPackagesCommand extends Command
             'name' => $package->getName(),
             'package_organisation' => $package->getVendor(),
             'package_name' => $package->getPackageName(),
-            'description' => preg_replace('{[\x00-\x1f]+}u', '', strip_tags($package->getDescription())),
+            'description' => Preg::replace('{[\x00-\x1f]+}u', '', strip_tags((string) $package->getDescription())),
             'type' => $package->getType(),
             'repository' => $package->getRepository(),
             'language' => $package->getLanguage(),
@@ -225,14 +237,17 @@ class IndexPackagesCommand extends Command
         return $record;
     }
 
-    private function createSearchableProvider(string $provided)
+    /**
+     * @return array<string, string|int|array{}>
+     */
+    private function createSearchableProvider(string $provided): array
     {
         return [
             'id' => $provided,
             'objectID' => 'virtual:'.$provided,
             'name' => $provided,
-            'package_organisation' => preg_replace('{/.*$}', '', $provided),
-            'package_name' => preg_replace('{^[^/]*/}', '', $provided),
+            'package_organisation' => Preg::replace('{/.*$}', '', $provided),
+            'package_name' => Preg::replace('{^[^/]*/}', '', $provided),
             'description' => '',
             'type' => 'virtual-package',
             'repository' => '',
@@ -245,6 +260,9 @@ class IndexPackagesCommand extends Command
         ];
     }
 
+    /**
+     * @return array<array{packageName: string}>
+     */
     private function getProviders(Package $package): array
     {
         return $this->getEM()->getConnection()->fetchAllAssociative(
@@ -259,9 +277,12 @@ class IndexPackagesCommand extends Command
         );
     }
 
+    /**
+     * @return string[]
+     */
     private function getTags(Package $package): array
     {
-        $tags = $this->getEM()->getConnection()->fetchAllAssociative(
+        $rows = $this->getEM()->getConnection()->fetchAllAssociative(
             'SELECT t.name FROM package p
                             JOIN package_version pv ON p.id = pv.package_id
                             JOIN version_tag vt ON vt.version_id = pv.id
@@ -271,26 +292,43 @@ class IndexPackagesCommand extends Command
             ['id' => $package->getId()]
         );
 
-        foreach ($tags as $idx => $tag) {
-            $tags[$idx] = $tag['name'];
+        $tags = [];
+        foreach ($rows as $tag) {
+            $tags[] = $tag['name'];
         }
 
-        return array_values(array_unique(array_map(function ($tag) {
-            return preg_replace('{[\s-]+}u', ' ', mb_strtolower(preg_replace('{[\x00-\x1f]+}u', '', $tag), 'UTF-8'));
-        }, $tags)));
+        return array_values(array_unique(array_map(
+            fn (string $tag) => Preg::replace('{[\s-]+}u', ' ', mb_strtolower(Preg::replace('{[\x00-\x1f]+}u', '', $tag), 'UTF-8')),
+            $tags
+        )));
     }
 
-    private function updateIndexedAt(array $idsToUpdate, string $time)
+    /**
+     * @param int[] $idsToUpdate
+     */
+    private function updateIndexedAt(array $idsToUpdate, string $time): void
     {
         $retries = 5;
         // retry loop in case of a lock timeout
         while ($retries--) {
             try {
+                // updating only if indexedAt is <crawledAt, to make sure the package is not stale for indexing anymore
+                // but in the nightly job where we index all packages anyway, we do not need to update all of them
                 $this->getEM()->getConnection()->executeQuery(
-                    'UPDATE package SET indexedAt=:indexed WHERE id IN (:ids)',
+                    'UPDATE package SET indexedAt=:indexed WHERE id IN (:ids) AND (indexedAt IS NULL OR indexedAt <= crawledAt)',
                     [
                         'ids' => $idsToUpdate,
                         'indexed' => $time,
+                    ],
+                    ['ids' => Connection::PARAM_INT_ARRAY]
+                );
+
+                // make sure that packages where crawledAt is set in far future do not get indexed repeatedly
+                $this->getEM()->getConnection()->executeQuery(
+                    'UPDATE package SET indexedAt=DATE_ADD(crawledAt, INTERVAL 1 SECOND) WHERE id IN (:ids) AND indexedAt <= crawledAt AND crawledAt > :tomorrow',
+                    [
+                        'ids' => $idsToUpdate,
+                        'tomorrow' => date('Y-m-d H:i:s', strtotime('+1day')),
                     ],
                     ['ids' => Connection::PARAM_INT_ARRAY]
                 );

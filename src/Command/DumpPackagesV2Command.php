@@ -16,6 +16,8 @@ use Doctrine\Persistence\ManagerRegistry;
 use App\Entity\Package;
 use App\Package\V2Dumper;
 use App\Service\Locker;
+use Psr\Log\LoggerInterface;
+use Seld\Signal\SignalHandler;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
@@ -33,7 +35,7 @@ class DumpPackagesV2Command extends Command
     private ManagerRegistry $doctrine;
     private string $cacheDir;
 
-    public function __construct(V2Dumper $dumper, Locker $locker, ManagerRegistry $doctrine, string $cacheDir)
+    public function __construct(V2Dumper $dumper, Locker $locker, ManagerRegistry $doctrine, string $cacheDir, private LoggerInterface $logger)
     {
         $this->dumper = $dumper;
         $this->locker = $locker;
@@ -42,7 +44,7 @@ class DumpPackagesV2Command extends Command
         parent::__construct();
     }
 
-    protected function configure()
+    protected function configure(): void
     {
         $this
             ->setName('packagist:dump-v2')
@@ -73,7 +75,7 @@ class DumpPackagesV2Command extends Command
         if ($gc) {
             $lockName .= '-gc';
         }
-        if (!$this->locker->lockCommand($lockName)) {
+        if (!$this->locker->lockCommand(__CLASS__)) {
             if ($verbose) {
                 $output->writeln('Aborting, another task is running already');
             }
@@ -84,10 +86,12 @@ class DumpPackagesV2Command extends Command
             try {
                 $this->dumper->gc();
             } finally {
-                $this->locker->unlockCommand($lockName);
+                $this->locker->unlockCommand(__CLASS__);
             }
             return 0;
         }
+
+        $signal = $force ? null : SignalHandler::create(null, $this->logger);
 
         $iterations = $force ? 1 : 120;
         try {
@@ -102,7 +106,13 @@ class DumpPackagesV2Command extends Command
                     ini_set('memory_limit', -1);
                     gc_enable();
 
+                    $ids = array_map('intval', $ids);
+
                     $this->dumper->dump($ids, $force, $verbose);
+                }
+
+                if ($signal !== null && $signal->isTriggered()) {
+                    break;
                 }
 
                 if (!$force) {
@@ -114,7 +124,7 @@ class DumpPackagesV2Command extends Command
                 }
             }
         } finally {
-            $this->locker->unlockCommand($lockName);
+            $this->locker->unlockCommand(__CLASS__);
         }
 
         return 0;

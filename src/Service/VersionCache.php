@@ -2,36 +2,38 @@
 
 namespace App\Service;
 
+use Composer\Pcre\Preg;
 use Composer\Repository\VersionCacheInterface;
 use App\Entity\Package;
 use App\Entity\Version;
+use DateTimeInterface;
 
 class VersionCache implements VersionCacheInterface
 {
-    /** @var array<string, array{version: string, normalizedVersion: string, source: array{reference: string|null, type: string|null, url: string|null}}> */
+    /** @var array<string, array{version: string, normalizedVersion: string, source: array{type: string|null, url: string|null, reference: string|null}|null}> */
     private array $versionCache;
 
+    /**
+     * @param array<string|int, array{version: string, normalizedVersion: string, source: array{type: string|null, url: string|null, reference: string|null}|null}> $existingVersions
+     * @param string[] $emptyReferences
+     */
     public function __construct(
         private Package $package,
-        /** @var array<string|int, array{version: string, normalizedVersion: string, source: array{reference: string|null, type: string|null, url: string|null}}> */
-        private array $existingVersions,
-        /** @var string[] */
+        array $existingVersions,
         private array $emptyReferences
     ) {
         $this->versionCache = [];
         foreach ($existingVersions as $version) {
             $this->versionCache[$version['version']] = $version;
         }
-        $this->package = $package;
-        $this->emptyReferences = $emptyReferences;
     }
 
     /**
      * @param string $version
      * @param string $identifier
-     * @return array{name: string, version: string, version_normalized: string, source: array{reference: string|null, type: string|null, url: string|null}}|false|null
+     * @return array{name: string, version: string, version_normalized: string, source: array{type: string|null, url: string|null, reference: string|null}|null}|false|null
      */
-    public function getVersionPackage($version, $identifier)
+    public function getVersionPackage($version, $identifier): array|false|null
     {
         if (!empty($this->versionCache[$version]['source']['reference']) && $this->versionCache[$version]['source']['reference'] === $identifier) {
             return [
@@ -53,7 +55,7 @@ class VersionCache implements VersionCacheInterface
     {
         foreach (array_keys($this->versionCache) as $v) {
             $v = (string) $v;
-            if (preg_replace('{\.x-dev$}', '', $v) === $version || preg_replace('{-dev$}', '', $v) === $version || preg_replace('{^dev-}', '', $v) === $version) {
+            if (Preg::replace('{\.x-dev$}', '', $v) === $version || Preg::replace('{-dev$}', '', $v) === $version || Preg::replace('{^dev-}', '', $v) === $version) {
                 unset($this->versionCache[$v]);
             }
         }
