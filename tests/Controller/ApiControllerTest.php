@@ -12,35 +12,17 @@
 
 namespace App\Tests\Controller;
 
-use Doctrine\DBAL\Connection;
-use Doctrine\Persistence\ManagerRegistry;
-use Exception;
 use App\Entity\Package;
+use App\Entity\SecurityAdvisory;
 use App\Entity\User;
+use App\SecurityAdvisory\GitHubSecurityAdvisoriesSource;
+use App\SecurityAdvisory\RemoteSecurityAdvisory;
+use App\SecurityAdvisory\Severity;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Depends;
-use Symfony\Bundle\FrameworkBundle\KernelBrowser;
-use Symfony\Bundle\FrameworkBundle\Test\WebTestCase;
 
-class ApiControllerTest extends WebTestCase
+class ApiControllerTest extends ControllerTestCase
 {
-    private KernelBrowser $client;
-
-    public function setUp(): void
-    {
-        $this->client = self::createClient();
-        static::getContainer()->get(Connection::class)->beginTransaction();
-
-        parent::setUp();
-    }
-
-    public function tearDown(): void
-    {
-        static::getContainer()->get(Connection::class)->rollBack();
-
-        parent::tearDown();
-    }
-
     public function testGithubFailsOnGet(): void
     {
         $this->client->request('GET', '/api/github');
@@ -57,22 +39,9 @@ class ApiControllerTest extends WebTestCase
     #[DataProvider('githubApiProvider')]
     public function testGithubApi($url): void
     {
-        $package = new Package;
-        $package->setName('test/'.md5(uniqid()));
-        $package->setRepository($url);
-
-        $user = new User;
-        $user->addPackage($package);
-        $user->setEnabled(true);
-        $user->setUsername('test');
-        $user->setEmail('test@example.org');
-        $user->setPassword('testtest');
-        $user->setApiToken('token');
-
-        $em = static::getContainer()->get(ManagerRegistry::class)->getManager();
-        $em->persist($package);
-        $em->persist($user);
-        $em->flush();
+        $user = self::createUser();
+        $package = self::createPackage('test/'.bin2hex(random_bytes(10)), $url, maintainers: [$user]);
+        $this->store($user, $package);
 
         $scheduler = $this->createMock('App\Service\Scheduler');
 
@@ -80,11 +49,11 @@ class ApiControllerTest extends WebTestCase
             ->method('scheduleUpdate')
             ->with($package);
 
-        static::$kernel->getContainer()->set('doctrine.orm.entity_manager', $em);
+        static::$kernel->getContainer()->set('doctrine.orm.entity_manager', self::getEM());
         static::$kernel->getContainer()->set('App\Service\Scheduler', $scheduler);
 
         $payload = json_encode(['repository' => ['url' => 'git://github.com/composer/composer']]);
-        $this->client->request('POST', '/api/github?username=test&apiToken=token', ['payload' => $payload]);
+        $this->client->request('POST', '/api/github?username=test&apiToken=api-token', ['payload' => $payload]);
         $this->assertEquals(202, $this->client->getResponse()->getStatusCode(), $this->client->getResponse()->getContent());
     }
 
@@ -98,6 +67,33 @@ class ApiControllerTest extends WebTestCase
         ];
     }
 
+    public function testUnsafeApiRejectsSafeApiToken(): void
+    {
+        $user = self::createUser();
+        $this->store($user);
+
+        $payload = json_encode(['repository' => 'https://github.com/composer/composer']);
+        $this->client->request('POST', '/api/create-package?username=test&apiToken=safe-api-token', ['payload' => $payload]);
+        $this->assertEquals(406, $this->client->getResponse()->getStatusCode(), $this->client->getResponse()->getContent());
+        $this->assertEquals(json_encode(['status' => 'error', 'message' => 'Missing or invalid username/apiToken in request']), $this->client->getResponse()->getContent());
+    }
+
+    public function testSafeApiAcceptsBothApiTokens(): void
+    {
+        $url = 'https://github.com/composer/composer';
+        $user = self::createUser();
+        $package = self::createPackage('test/'.bin2hex(random_bytes(10)), $url, maintainers: [$user]);
+        $this->store($user, $package);
+
+        $payload = json_encode(['repository' => $url]);
+        $this->client->request('POST', '/api/update-package?username=test&apiToken=safe-api-token', ['payload' => $payload]);
+        $this->assertEquals(202, $this->client->getResponse()->getStatusCode(), $this->client->getResponse()->getContent());
+
+        $payload = json_encode(['repository' => 'https://packagist.org/packages/'.$package->getName()]);
+        $this->client->request('POST', '/api/update-package?username=test&apiToken=api-token', ['payload' => $payload]);
+        $this->assertEquals(202, $this->client->getResponse()->getStatusCode(), $this->client->getResponse()->getContent());
+    }
+
     #[Depends('testGitHubFailsWithInvalidCredentials')]
     #[DataProvider('urlProvider')]
     public function testUrlDetection($endpoint, $url, $expectedOK): void
@@ -107,7 +103,7 @@ class ApiControllerTest extends WebTestCase
             $absUrl = substr($url, 1);
             $payload = json_encode(['canon_url' => $canonUrl, 'repository' => ['absolute_url' => $absUrl]]);
         } else {
-            $payload = json_encode(['repository' => ['url' => $url]]);
+            $payload = json_encode(['repository' => $url]);
         }
 
         $this->client->request('POST', '/api/'.$endpoint.'?username=INVALID_USER&apiToken=INVALID_TOKEN', ['payload' => $payload]);
@@ -159,5 +155,30 @@ class ApiControllerTest extends WebTestCase
             ['github', 'https://github.com', false],
             ['update-package', 'ssh://ghe.example.org/user/jjjjj.git', false],
         ];
+    }
+
+    public function testSecurityAdvisories(): void
+    {
+        $advisory = new SecurityAdvisory(new RemoteSecurityAdvisory(
+            'GHSA-1234-1234-1234',
+            'Advisory Title',
+            'acme/package',
+            '<1.0.1',
+            'https://example.org',
+            'CVE-12345',
+            new \DateTimeImmutable(),
+            SecurityAdvisory::PACKAGIST_ORG,
+            [],
+            GitHubSecurityAdvisoriesSource::SOURCE_NAME,
+            Severity::MEDIUM,
+        ), GitHubSecurityAdvisoriesSource::SOURCE_NAME);
+        $this->store($advisory);
+
+        $this->client->request('GET', '/api/security-advisories/?packages[]=acme/package');
+        $this->assertEquals(200, $this->client->getResponse()->getStatusCode(), $this->client->getResponse()->getContent());
+
+        $content = json_decode($this->client->getResponse()->getContent(), true, flags: JSON_THROW_ON_ERROR);
+        $this->assertArrayHasKey('acme/package', $content['advisories']);
+        $this->assertCount(1, $content['advisories']['acme/package']);
     }
 }

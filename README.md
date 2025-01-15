@@ -19,7 +19,7 @@ These steps are provided for development purposes only.
 ### Requirements
 
 - **PHP** for the web app
-- **NPM** for the frontend build
+- **NPM** (or Docker) for the frontend build
 - **[Symfony CLI](https://symfony.com/download)** to run the web server
 - **MySQL** (or Docker) for the main data store
 - **Redis** (or Docker) for some functionality (favorites, download statistics)
@@ -33,14 +33,19 @@ These steps are provided for development purposes only.
    composer install
    npm install
    ```
+   Ensure env vars are set up correctly, you probably need to set `APP_MAILER_FROM_EMAIL`, `APP_MAILER_FROM_NAME` and `APP_DEV_EMAIL_RECIPIENT` in `.env.local`. Set also `MAILER_DSN` if you'd like to receive email.
+
 3. Start the web server:
    ```bash
-   symfony serve
+   symfony serve -d
    ```
+
 4. Start MySQL & Redis:
    ```bash
-   docker-compose up -d # or somehow run MySQL & Redis on localhost without docker
+   docker compose up -d # or somehow run MySQL & Redis on localhost without Docker
    ```
+   This mounts the current working directory into the node container and runs npm install and npm run build automatically.
+
 5. Create 2 databases:
     - `packagist` - for the web app
     - `packagist_test` - for running the tests
@@ -48,12 +53,15 @@ These steps are provided for development purposes only.
    bin/console doctrine:database:create
    bin/console doctrine:database:create --env=test
    ```
+
 6. Setup the database schema:
    ```bash
    bin/console doctrine:schema:create
    ```
+
 7. Run a CRON job `bin/console packagist:run-workers` to make sure packages update.
-8. Run `npm run build` or `npm run dev` to build (or build&watch) css/js files.
+
+8. Run `npm run build` or `npm run dev` to build (or build&watch) css/js files. When using Docker run `docker compose run node npm run dev` to watch css/js files.
 
 You should now be able to access the site, create a user, etc.
 
@@ -62,12 +70,19 @@ You should now be able to access the site, create a user, etc.
 You can get test data by running the fixtures:
 
 ```bash
-bin/console doctrine:fixtures:load
+bin/console doctrine:fixtures:load --group base
+bin/console doctrine:fixtures:load --group downloads --append
  ```
 
-This will create 100 packages from packagist.org, update them from GitHub,
-populate them with fake download stats, and assign a user named `dev`
-(with password: `dev`) as their maintainer.
+This will create some packages, update them from GitHub, populate them
+with fake download stats, and assign a user named `dev` (with password: `dev`)
+as their maintainer.
+
+There is also a user `user` (with password: `user`) that has no access if you
+need to check readonly views.
+
+Finally there is a user `admin` (with password: `admin`) that has super admin
+permissions.
 
 ### Search
 

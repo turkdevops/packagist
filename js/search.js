@@ -27,10 +27,15 @@ document.addEventListener('keydown', function (e) {
     e.preventDefault();
 });
 
-var searchParameters = {};
+var searchParameters = location.href.match(/\/extensions/) === null
+    ? {}
+    : {
+    numericFilters: 'extension = 1',
+};
 
+// avoid reflective XSS issues
 if (decodeURI(location.search).match(/[<>]/)) {
-    location.replace(location.pathname);
+    location.replace(location.origin + location.pathname);
 }
 
 var searchThrottle = null;
@@ -94,6 +99,10 @@ var search = instantsearch({
         // force focus to prevent algolia from updating the search field input with the modified value
         if (helper.state.query.match(/-/)) {
             document.getElementById('search_query_query').focus();
+        }
+
+        if (helper.state.query.match(/^PKSA-.{14}$/) || helper.state.query.match(/^GHSA-.{14}$/) || helper.state.query.match(/^CVE-\d{4}-\d+$/)) {
+            document.location.href = "/security-advisories/" + helper.state.query;
         }
 
         helper.state.query = helper.state.query.replace(new RegExp('([^\\s])-', 'g'), '$1--');

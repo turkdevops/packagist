@@ -41,8 +41,8 @@ use DateTimeInterface;
  *     autoload?: array<mixed>,
  *     extra?: array<mixed>,
  *     target-dir?: string,
- *     include-path?: list<string>,
- *     bin?: list<string>,
+ *     include-path?: array<string>,
+ *     bin?: array<string>,
  *     default-branch?: true,
  *     require?: array<string, string>,
  *     require-dev?: array<string, string>,
@@ -50,7 +50,8 @@ use DateTimeInterface;
  *     conflict?: array<string, string>,
  *     provide?: array<string, string>,
  *     replace?: array<string, string>,
- *     abandoned?: string|true
+ *     abandoned?: string|true,
+ *     php-ext?: array{priority?: int, configure-options?: list<array{name: string, description?: string}>}
  * }
  */
 #[ORM\Entity(repositoryClass: 'App\Entity\VersionRepository')]
@@ -81,19 +82,19 @@ class Version
     /**
      * @var array<mixed>
      */
-    #[ORM\Column(type: 'array')]
+    #[ORM\Column(type: 'json')]
     private array $extra = [];
 
     /**
      * @var Collection<int, Tag>&Selectable<int, Tag>
      */
-    #[ORM\ManyToMany(targetEntity: Tag::class, inversedBy: 'versions')]
+    #[ORM\ManyToMany(targetEntity: Tag::class, inversedBy: 'versions', cascade: ['persist', 'detach'])]
     #[ORM\JoinTable(name: 'version_tag')]
     #[ORM\JoinColumn(name: 'version_id', referencedColumnName: 'id')]
     #[ORM\InverseJoinColumn(name: 'tag_id', referencedColumnName: 'id')]
     private Collection $tags;
 
-    #[ORM\ManyToOne(targetEntity: Package::class, fetch: 'EAGER', inversedBy: 'versions')]
+    #[ORM\ManyToOne(targetEntity: Package::class, inversedBy: 'versions')]
     #[Assert\Type(type: Package::class)]
     private Package|null $package;
 
@@ -122,37 +123,37 @@ class Version
     /**
      * @var Collection<int, RequireLink>&Selectable<int, RequireLink>
      */
-    #[ORM\OneToMany(targetEntity: 'App\Entity\RequireLink', mappedBy: 'version')]
+    #[ORM\OneToMany(targetEntity: 'App\Entity\RequireLink', mappedBy: 'version', cascade: ['persist', 'detach'])]
     private Collection $require;
 
     /**
      * @var Collection<int, ReplaceLink>&Selectable<int, ReplaceLink>
      */
-    #[ORM\OneToMany(targetEntity: 'App\Entity\ReplaceLink', mappedBy: 'version')]
+    #[ORM\OneToMany(targetEntity: 'App\Entity\ReplaceLink', mappedBy: 'version', cascade: ['persist', 'detach'])]
     private Collection $replace;
 
     /**
      * @var Collection<int, ConflictLink>&Selectable<int, ConflictLink>
      */
-    #[ORM\OneToMany(targetEntity: 'App\Entity\ConflictLink', mappedBy: 'version')]
+    #[ORM\OneToMany(targetEntity: 'App\Entity\ConflictLink', mappedBy: 'version', cascade: ['persist', 'detach'])]
     private Collection $conflict;
 
     /**
      * @var Collection<int, ProvideLink>&Selectable<int, ProvideLink>
      */
-    #[ORM\OneToMany(targetEntity: 'App\Entity\ProvideLink', mappedBy: 'version')]
+    #[ORM\OneToMany(targetEntity: 'App\Entity\ProvideLink', mappedBy: 'version', cascade: ['persist', 'detach'])]
     private Collection $provide;
 
     /**
      * @var Collection<int, DevRequireLink>&Selectable<int, DevRequireLink>
      */
-    #[ORM\OneToMany(targetEntity: 'App\Entity\DevRequireLink', mappedBy: 'version')]
+    #[ORM\OneToMany(targetEntity: 'App\Entity\DevRequireLink', mappedBy: 'version', cascade: ['persist', 'detach'])]
     private Collection $devRequire;
 
     /**
      * @var Collection<int, SuggestLink>&Selectable<int, SuggestLink>
      */
-    #[ORM\OneToMany(targetEntity: 'App\Entity\SuggestLink', mappedBy: 'version')]
+    #[ORM\OneToMany(targetEntity: 'App\Entity\SuggestLink', mappedBy: 'version', cascade: ['persist', 'detach'])]
     private Collection $suggest;
 
     /**
@@ -203,6 +204,12 @@ class Version
     #[ORM\Column(name: 'authors', type: 'json')]
     private array $authors = [];
 
+    /**
+     * @var array{priority?: int, configure-options?: list<array{name: string, description?: string}>}|null
+     */
+    #[ORM\Column(type: 'json', options: ['default' => null], nullable: true)]
+    private array|null $phpExt = null;
+
     #[ORM\Column(name: 'defaultBranch', type: 'boolean', options: ['default' => false])]
     private bool $isDefaultBranch = false;
 
@@ -252,6 +259,7 @@ class Version
         }
         unset($author);
 
+        /** @var VersionArray $data */
         $data = [
             'name' => $this->getName(),
             'description' => (string) $this->getDescription(),
@@ -269,8 +277,12 @@ class Version
         if ($serializeForApi && $this->getSupport()) {
             $data['support'] = $this->getSupport();
         }
-        if ($this->getFunding()) {
-            $data['funding'] = $this->getFundingSorted();
+        if ($serializeForApi && $this->getPhpExt() !== null) {
+            $data['php-ext'] = $this->getPhpExt();
+        }
+        $funding = $this->getFundingSorted();
+        if ($funding !== null) {
+            $data['funding'] = $funding;
         }
         if ($this->getReleasedAt()) {
             $data['time'] = $this->getReleasedAt()->format('Y-m-d\TH:i:sP');
@@ -331,11 +343,13 @@ class Version
      */
     public function toV2Array(array $versionData): array
     {
-        $array = $this->toArray($versionData);
+        $array = $this->toArray($versionData, true);
 
-        if ($this->getSupport()) {
-            $array['support'] = $this->getSupport();
+        if (isset($array['support'])) {
             ksort($array['support']);
+        }
+        if (isset($array['php-ext']['configure-options']) && is_array($array['php-ext']['configure-options'])) {
+            usort($array['php-ext']['configure-options'], fn ($a, $b) => ($a['name'] ?? '') <=> ($b['name'] ?? ''));
         }
 
         return $array;
@@ -629,6 +643,17 @@ class Version
         return $this->tags;
     }
 
+    public function hasDevTag(): bool
+    {
+        foreach ($this->getTags() as $tag) {
+            if ($tag->isDev()) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     public function setUpdatedAt(DateTimeInterface $updatedAt): void
     {
         $this->updatedAt = $updatedAt;
@@ -663,6 +688,22 @@ class Version
     public function setAuthors(array $authors): void
     {
         $this->authors = $authors;
+    }
+
+    /**
+     * @return array{priority?: int, configure-options?: list<array{name: string, description?: string}>}|null
+     */
+    public function getPhpExt(): array|null
+    {
+        return $this->phpExt;
+    }
+
+    /**
+     * @param array{priority?: int, configure-options?: list<array{name: string, description?: string}>}|null $phpExt
+     */
+    public function setPhpExt(array|null $phpExt): void
+    {
+        $this->phpExt = $phpExt;
     }
 
     public function isDefaultBranch(): bool

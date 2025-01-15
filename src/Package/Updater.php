@@ -13,11 +13,16 @@
 namespace App\Package;
 
 use App\Entity\Dependent;
+use App\Entity\PackageFreezeReason;
+use App\HtmlSanitizer\ReadmeImageSanitizer;
+use App\HtmlSanitizer\ReadmeLinkSanitizer;
+use App\Util\HttpDownloaderOptionsFactory;
 use cebe\markdown\GithubMarkdown;
 use Composer\Package\AliasPackage;
 use Composer\Pcre\Preg;
 use Composer\Repository\VcsRepository;
 use Composer\Repository\Vcs\GitHubDriver;
+use Composer\Repository\Vcs\GitLabDriver;
 use Composer\Repository\Vcs\VcsDriverInterface;
 use Composer\Repository\InvalidRepositoryException;
 use Composer\Util\ErrorHandler;
@@ -31,10 +36,17 @@ use App\Entity\VersionRepository;
 use App\Entity\SuggestLink;
 use App\Model\ProviderManager;
 use App\Model\VersionIdCache;
+use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\Persistence\ManagerRegistry;
 use Doctrine\DBAL\Connection;
 use App\Service\VersionCache;
 use Composer\Package\CompletePackageInterface;
+use Symfony\Component\HtmlSanitizer\HtmlSanitizer;
+use Symfony\Component\HtmlSanitizer\HtmlSanitizerConfig;
+use Symfony\Component\Mailer\MailerInterface;
+use Symfony\Component\Mime\Address;
+use Symfony\Component\Mime\Email;
+use Symfony\Component\Routing\Generator\UrlGeneratorInterface;
 use Webmozart\Assert\Assert;
 
 /**
@@ -75,8 +87,16 @@ class Updater
         private ManagerRegistry $doctrine,
         private ProviderManager $providerManager,
         private VersionIdCache $versionIdCache,
+        private MailerInterface $mailer,
+        private string $mailFromEmail,
+        private UrlGeneratorInterface $urlGenerator,
     ) {
         ErrorHandler::register();
+    }
+
+    public function __destruct()
+    {
+        restore_error_handler();
     }
 
     /**
@@ -88,7 +108,7 @@ class Updater
      */
     public function update(IOInterface $io, Config $config, Package $package, VcsRepository $repository, int $flags = 0, ?array $existingVersions = null, ?VersionCache $versionCache = null): Package
     {
-        $httpDownloader = new HttpDownloader($io, $config);
+        $httpDownloader = new HttpDownloader($io, $config, HttpDownloaderOptionsFactory::getOptions());
 
         $deleteDate = new \DateTime();
         $deleteDate->modify('-1day');
@@ -99,6 +119,45 @@ class Updater
         $driver = $repository->getDriver();
         if (!$driver) {
             throw new \RuntimeException('Driver could not be established for package '.$package->getName().' ('.$package->getRepository().')');
+        }
+
+        if ($package->isFrozen()) {
+            return $package;
+        }
+
+        $remoteId = null;
+        if ($driver instanceof GitHubDriver) {
+            $repoData = $driver->getRepoData();
+            if (isset($repoData['repository']['id'])) {
+                $remoteId = 'github.com/'.$repoData['repository']['id'];
+            }
+        } elseif ($driver instanceof GitLabDriver) {
+            $repoData = $driver->getRepoData();
+            if (isset($repoData['id'])) {
+                $remoteId = 'gitlab.com/'.$repoData['id'];
+            }
+        }
+
+        if ($remoteId !== null) {
+            if (!$package->getRemoteId()) {
+                $package->setRemoteId($remoteId);
+            }
+            if ($package->getRemoteId() !== $remoteId) {
+                $package->freeze(PackageFreezeReason::RemoteIdMismatch);
+                $em->flush();
+                $io->writeError('<error>Skipping update as the source repository has a remote id mismatch. Expected '.$package->getRemoteId().' but got ' . $remoteId.'.</error>');
+
+                $message = (new Email())
+                    ->subject($package->getName().' frozen due to remote id mismatch')
+                    ->from(new Address($this->mailFromEmail))
+                    ->to($this->mailFromEmail)
+                    ->text('Check out '.$this->urlGenerator->generate('view_package', ['name' => $package->getName()], UrlGeneratorInterface::ABSOLUTE_URL).' was not repo-jacked.')
+                ;
+                $message->getHeaders()->addTextHeader('X-Auto-Response-Suppress', 'OOF, DR, RN, NRN, AutoReply');
+                $this->mailer->send($message);
+
+                return $package;
+            }
         }
 
         $rootIdentifier = $driver->getRootIdentifier();
@@ -183,8 +242,9 @@ class Updater
             if ($result['updated']) {
                 assert($result['object'] instanceof Version);
                 $em->flush();
-                $em->clear();
-                $package = $em->merge($package);
+
+                // detach version once flushed to avoid gathering lots of data in memory
+                $em->detach($result['object']);
 
                 $this->versionIdCache->insertVersion($package, $result['object']);
                 $versionId = $result['object']->getId();
@@ -213,7 +273,7 @@ class Updater
         $em->getConnection()->executeStatement(
             'UPDATE package_version SET updatedAt = :now, softDeletedAt = NULL WHERE id IN (:ids) AND softDeletedAt IS NOT NULL',
             ['now' => date('Y-m-d H:i:s'), 'ids' => $idsToMarkUpdated],
-            ['ids' => Connection::PARAM_INT_ARRAY]
+            ['ids' => ArrayParameterType::INTEGER]
         );
 
         // remove outdated versions
@@ -239,19 +299,30 @@ class Updater
             );
         }
 
-        if (Preg::isMatchStrictGroups('{^(?:git://|git@|https?://)github.com[:/]([^/]+)/(.+?)(?:\.git|/)?$}i', $package->getRepository(), $match)) {
+        if (null !== ($match = $package->getGitHubComponents())) {
             $this->updateGitHubInfo($httpDownloader, $package, $match[1], $match[2], $driver);
+        } elseif (null !== ($match = $package->getGitLabComponents())) {
+            $this->updateGitLabInfo($httpDownloader, $io, $package, $match[1], $match[2], $driver);
         } else {
             $this->updateReadme($io, $package, $driver);
         }
 
+        $usingDetails = '';
+        try {
+            $gitDriverProperty = new \ReflectionProperty($driver, 'gitDriver');
+            if (null !== $gitDriverProperty->getValue($driver)) {
+                $usingDetails = ' (via GitDriver fallback instance)';
+            }
+        } catch (\Throwable $e) {}
+        $io->writeError('Updated from '.$package->getRepository().' using ' . $driver::class . $usingDetails);
+
         // make sure the package exists in the package list if for some reason adding it on submit failed
-        if ($package->getReplacementPackage() !== 'spam/spam' && !$this->providerManager->packageExists($package->getName())) {
+        if (!$this->providerManager->packageExists($package->getName())) {
             $this->providerManager->insertPackage($package);
         }
 
-        $package->setUpdatedAt(new \DateTime);
-        $package->setCrawledAt(new \DateTime);
+        $package->setUpdatedAt(new \DateTimeImmutable());
+        $package->setCrawledAt(new \DateTimeImmutable());
 
         if ($flags & self::FORCE_DUMP) {
             $package->setDumpedAt(null);
@@ -291,6 +362,8 @@ class Updater
             if (
                 // update if the source reference has changed (re-tag or new commit on branch)
                 ($source['reference'] ?? null) !== $data->getSourceReference()
+                // or the source has some corrupted github private url
+                || (isset($source['url']) && is_string($source['url']) && Preg::isMatch('{^git@github.com:.*?\.git$}', $source['url']))
                 // or if the right flag is set
                 || ($flags & self::UPDATE_EQUAL_REFS)
                 // or if the package must be marked abandoned from composer.json
@@ -312,6 +385,7 @@ class Updater
         $version->setVersion($data->getPrettyVersion());
         $version->setNormalizedVersion($normVersion);
         $version->setDevelopment($data->isDev());
+        $version->setPhpExt($data->getPhpExt());
 
         $em->persist($version);
 
@@ -322,6 +396,7 @@ class Updater
         // update the package description only for the default branch
         if ($data->isDefaultBranch()) {
             $package->setDescription($descr);
+            $package->setType($this->sanitize($data->getType()));
             if ($data->isAbandoned() && !$package->isAbandoned()) {
                 $io->write('Marking package abandoned as per composer metadata from '.$version->getVersion());
                 $package->setAbandoned(true);
@@ -342,6 +417,10 @@ class Updater
         if ($data->getSourceType()) {
             $source['type'] = $data->getSourceType();
             $source['url'] = $data->getSourceUrl();
+            // force public URLs even if the package somehow got downgraded to a GitDriver
+            if (is_string($source['url']) && Preg::isMatch('{^git@github.com:(?P<repo>.*?)\.git$}', $source['url'], $match)) {
+                $source['url'] = 'https://github.com/'.$match['repo'];
+            }
             $source['reference'] = $data->getSourceReference();
             $version->setSource($source);
         } else {
@@ -361,7 +440,7 @@ class Updater
         if ($data->getType()) {
             $type = $this->sanitize($data->getType());
             $version->setType($type);
-            if ($type !== $package->getType()) {
+            if (null === $package->getType()) {
                 $package->setType($type);
             }
         }
@@ -435,7 +514,7 @@ class Updater
             foreach ($data->{$opts['method']}() as $link) {
                 $constraint = $link->getPrettyConstraint();
                 if (false !== strpos($constraint, ',') && false !== strpos($constraint, '@')) {
-                    $constraint = Preg::replaceCallback('{([><]=?\s*[^@]+?)@([a-z]+)}i', static function ($matches) {
+                    $constraint = Preg::replaceCallbackStrictGroups('{([><]=?\s*[^@]+?)@([a-z]+)}i', static function ($matches) {
                         if ($matches[2] === 'stable') {
                             return $matches[1];
                         }
@@ -570,7 +649,7 @@ class Updater
         $repoData = $driver->getRepoData();
 
         try {
-            $opts = ['http' => ['header' => ['Accept: application/vnd.github.v3.html']]];
+            $opts = ['http' => ['header' => ['Accept: application/vnd.github.html+json', 'X-GitHub-Api-Version: 2022-11-28']]];
             $readme = $httpDownloader->get($baseApiUrl.'/readme', $opts)->getBody();
         } catch (\Exception $e) {
             if (!$e instanceof \Composer\Downloader\TransportException || $e->getCode() !== 404) {
@@ -602,11 +681,48 @@ class Updater
         }
     }
 
+    private function updateGitLabInfo(HttpDownloader $httpDownloader, IOInterface $io, Package $package, string $owner, string $repo, VcsDriverInterface $driver): void
+    {
+        // GitLab provides a generic URL for the original formatted README,
+        // which requires further elaboration. Here we use the already existing
+        // function to handle it, and back here to populate the other available
+        // metadata
+        $this->updateReadme($io, $package, $driver);
+
+        if (!$driver instanceof GitLabDriver) {
+            return;
+        }
+
+        $repoData = $driver->getRepoData();
+
+        if (isset($repoData['star_count']) && is_numeric($repoData['star_count'])) {
+            $package->setGitHubStars((int) $repoData['star_count']);
+        }
+        if (isset($repoData['forks_count']) && is_numeric($repoData['forks_count'])) {
+            $package->setGitHubForks((int) $repoData['forks_count']);
+        }
+        if (isset($repoData['open_issues_count']) && is_numeric($repoData['open_issues_count'])) {
+            $package->setGitHubOpenIssues((int) $repoData['open_issues_count']);
+        }
+
+        // GitLab does not include a "watch" feature
+        $package->setGitHubWatches(null);
+    }
+
     /**
      * Prepare the readme by stripping elements and attributes that are not supported .
      */
     private function prepareReadme(string $readme, ?string $host = null, ?string $owner = null, ?string $repo = null): string
     {
+        // detect base path for github readme if file is located in a subfolder like docs/README.md
+        $basePath = '';
+        if ($host === 'github.com' && Preg::isMatchStrictGroups('{^<div id="readme" [^>]+?data-path="([^"]+)"}', $readme, $match) && false !== strpos($match[1], '/')) {
+            $basePath = dirname($match[1]);
+        }
+        if ($basePath) {
+            $basePath .= '/';
+        }
+
         $elements = [
             'p',
             'br',
@@ -623,111 +739,47 @@ class Updater
             'q', 'blockquote', 'abbr', 'cite',
             'table', 'thead', 'tbody', 'th', 'tr', 'td',
             'a', 'span',
-            'img',
             'details', 'summary',
         ];
 
-        $attributes = [
-            'img.src', 'img.title', 'img.alt', 'img.width', 'img.height', 'img.style',
-            'a.href', 'a.target', 'a.rel', 'a.id',
-            'td.colspan', 'td.rowspan', 'th.colspan', 'th.rowspan',
-            'th.align', 'td.align', 'p.align',
-            'h1.align', 'h2.align', 'h3.align', 'h4.align', 'h5.align', 'h6.align',
-            '*.class', 'details.open',
-        ];
-
-        // detect base path for github readme if file is located in a subfolder like docs/README.md
-        $basePath = '';
-        if ($host === 'github.com' && Preg::isMatchStrictGroups('{^<div id="readme" [^>]+?data-path="([^"]+)"}', $readme, $match) && false !== strpos($match[1], '/')) {
-            $basePath = dirname($match[1]);
-        }
-        if ($basePath) {
-            $basePath .= '/';
+        $config = (new HtmlSanitizerConfig());
+        foreach ($elements as $el) {
+            $config = $config->allowElement($el);
         }
 
-        $config = \HTMLPurifier_Config::createDefault();
-        $config->set('HTML.AllowedElements', implode(',', $elements));
-        $config->set('HTML.AllowedAttributes', implode(',', $attributes));
-        $config->set('Attr.EnableID', true);
-        $config->set('Attr.AllowedFrameTargets', ['_blank']);
+        $config = $config
+            // TODO symfony/html-sanitizer:7.2 ->defaultAction(HtmlSanitizerAction::Block)
+            ->blockElement('div')
+            ->blockElement('article')
+            ->blockElement('g-emoji')
+            ->allowElement('img', ['src', 'title', 'alt', 'width', 'height'])
+            ->allowElement('a', ['href', 'target', 'id'])
+            ->allowElement('td', ['colspan', 'rowspan'])
+            ->allowElement('th', ['colspan', 'rowspan'])
+            ->allowElement('details', ['open'])
+            ->allowAttribute('align', ['th', 'td', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
+            ->allowAttribute('class', '*')
+            ->allowLinkSchemes(['https', 'http', 'mailto'])
+            ->forceAttribute('a', 'rel', 'nofollow noindex noopener external ugc')
+            ->withAttributeSanitizer(new ReadmeLinkSanitizer($host, $owner.'/'.$repo, $basePath))
+            ->withAttributeSanitizer(new ReadmeImageSanitizer($host, $owner.'/'.$repo, $basePath))
+            ->allowRelativeLinks()
+            ->allowRelativeMedias()
+            ->withMaxInputLength(10_000_000);
 
-        // add custom HTML tag definitions
-        $def = $config->getHTMLDefinition(true);
-        Assert::notNull($def);
-        $def->addElement('details', 'Block', 'Flow', 'Common', [
-          'open' => 'Bool#open',
-        ]);
-        $def->addElement('summary', 'Inline', 'Inline', 'Common');
-
-        $purifier = new \HTMLPurifier($config);
-        $readme = $purifier->purify($readme);
-
-        libxml_use_internal_errors(true);
-        $dom = new \DOMDocument();
-        $dom->loadHTML('<?xml encoding="UTF-8">' . $readme);
-
-        // Links can not be trusted, mark them nofollow and convert relative to absolute links
-        $links = $dom->getElementsByTagName('a');
-        foreach ($links as $link) {
-            $link->setAttribute('rel', 'nofollow noindex noopener external ugc');
-            if ('#' === substr($link->getAttribute('href'), 0, 1)) {
-                $link->setAttribute('href', '#user-content-'.substr($link->getAttribute('href'), 1));
-            } elseif ('mailto:' === substr($link->getAttribute('href'), 0, 7)) {
-                // do nothing
-            } elseif ($host === 'github.com' && !str_contains($link->getAttribute('href'), '//')) {
-                $link->setAttribute(
-                    'href',
-                    'https://github.com/'.$owner.'/'.$repo.'/blob/HEAD/'.$basePath.$link->getAttribute('href')
-                );
-            } elseif ($host === 'gitlab.com' && !str_contains($link->getAttribute('href'), '//')) {
-                $link->setAttribute(
-                    'href',
-                    'https://gitlab.com/'.$owner.'/'.$repo.'/-/blob/HEAD/'.$basePath.$link->getAttribute('href')
-                );
-            }
-        }
-
-        // embed images of selected hosts by converting relative links to accessible URLs
-        if (in_array($host, ['github.com', 'gitlab.com', 'bitbucket.org'], true)) {
-            $images = $dom->getElementsByTagName('img');
-            foreach ($images as $img) {
-                if (!str_contains($img->getAttribute('src'), '//')) {
-                    $imgSrc = match ($host) {
-                        'github.com' => 'https://raw.github.com/'.$owner.'/'.$repo.'/HEAD/'.$basePath.$img->getAttribute('src'),
-                        'gitlab.com' => 'https://gitlab.com/'.$owner.'/'.$repo.'/-/raw/HEAD/'.$basePath.$img->getAttribute('src'),
-                        'bitbucket.org' => 'https://bitbucket.org/'.$owner.'/'.$repo.'/raw/HEAD/'.$basePath.$img->getAttribute('src'),
-                    };
-                    $img->setAttribute('src', $imgSrc);
-                }
-            }
-        }
+        $sanitizer = new HtmlSanitizer($config);
+        $readme = $sanitizer->sanitizeFor('body', $readme);
 
         // remove first page element if it's a <h1> or <h2>, because it's usually
         // the project name or the `README` string which we don't need
-        $first = $dom->getElementsByTagName('body')->item(0);
-        if ($first) {
-            $first = $first->childNodes->item(0);
-        }
-
-        if ($first && ('h1' === $first->nodeName || 'h2' === $first->nodeName)) {
-            $first->parentNode?->removeChild($first);
-        }
-
-        $readme = $dom->saveHTML();
-        Assert::string($readme);
-        $readme = substr($readme, strpos($readme, '<body>') + 6);
-        $readme = substr($readme, 0, strrpos($readme, '</body>') ?: PHP_INT_MAX);
-
-        libxml_use_internal_errors(false);
-        libxml_clear_errors();
+        $readme = Preg::replace('{^<(h[12])[^>]*>.*</(?1)>}', '', $readme);
 
         return str_replace("\r\n", "\n", $readme);
     }
 
     /**
-     * @template T of string|null
-     * @phpstan-param T $str
-     * @phpstan-return T
+     * @phpstan-param string|null $str
+     * @phpstan-return ($str is string ? string : null)
      */
     private function sanitize(string|null $str): string|null
     {

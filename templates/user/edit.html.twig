@@ -1,7 +1,7 @@
 {% extends "user/layout.html.twig" %}
 
 {% block user_content %}
-    {{ form_start(form, { 'action': path('edit_profile'), 'attr': { 'class': 'edit_profile col-md-6' } }) }}
+    {{ form_start(form, { 'action': path('edit_profile'), 'attr': { 'class': 'edit_profile col-md-6', 'id': 'edit_profile' } }) }}
         {{ form_errors(form) }}
 
         <div class="form-group clearfix">
@@ -37,13 +37,13 @@
             {{ form_errors(form.failureNotifications) }}
             <label>
                 {{ form_widget(form.failureNotifications) }}
-                {{ 'profile.notify_on_failure'|trans }}
+                Notify me of package update failures
             </label>
         </div>
 
         {{ form_rest(form) }}
 
-        <input type="submit" class="btn btn-block btn-success btn-lg" value="Update" />
+        <input type="submit" class="btn btn-block btn-success btn-lg" value="Update" id="_edit_profile_submit" />
 
         <hr>
 
@@ -51,7 +51,11 @@
         <a href="{{ app.user.githubId ? '#' : path('connect_github_start') }}" class="btn btn-block btn-github btn-lg {{ app.user.githubId ? 'disabled' : 'btn-primary' }}">
             <span class="icon-github"></span>
             {% set ghUser = app.user.githubUsername %}
-            {{ (app.user.githubId ? 'profile.accounts_connected' : 'profile.connect_accounts')|trans({"%user%": ghUser|default('unknown')}) }}
+            {% if app.user.githubId %}
+                Account connected to {{ ghUser|default('unknown') }}
+            {% else %}
+                Connect accounts
+            {% endif %}
         </a>
 
         {% if app.user.githubId %}

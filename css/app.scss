@@ -150,6 +150,28 @@ strong {
     background: #2d2d32;
 }
 
+.banner {
+    position: absolute;
+    text-align: center;
+    left: 50%;
+    top: 9px;
+    width: 340px;
+    height: 40px;
+    margin-left: -170px;
+    background: red;
+    padding: 10px;
+    border-radius: 5px;
+    &.alert-error::before {
+        content: '';
+    }
+    z-index: 500;
+    .banner-close {
+        float: right;
+        padding-top: 2px;
+        cursor: pointer;
+    }
+}
+
 .navbar {
     margin: 0;
     border: 0;
@@ -668,6 +690,7 @@ input:focus:invalid:focus, textarea:focus:invalid:focus, select:focus:invalid:fo
     line-height: 20px;
     padding: 6px 0;
     margin: 0 -4px 6px 0;
+    padding-bottom: 7px;
     border-right: 0;
     background: none;
     color: #c6cacd;
@@ -682,16 +705,15 @@ input:focus:invalid:focus, textarea:focus:invalid:focus, select:focus:invalid:fo
 
 .api-token-group {
     display: block;
-    min-height: 45px;
+    margin-bottom: 5px;
 }
-.api-token-group #api-token {
+.api-token-group .api-token {
   width: 85%;
-  position: absolute;
   right: 0;
   text-align: center;
 }
 .api-token-group .btn-show-api-token {
-  width: 145px;
+  width: 185px;
   position: absolute;
   z-index: 10;
 }
@@ -1507,6 +1529,7 @@ input:focus:invalid:focus, textarea:focus:invalid:focus, select:focus:invalid:fo
     padding: 0 0 15px;
     border-bottom: 1px solid #f28d1a;
     color: #2d2d32;
+    clear: left;
 }
 
 .wrapper .content h3.title {
@@ -1771,6 +1794,17 @@ body {
     text-decoration: inherit;
     text-align: center;
     speak: none;
+}
+
+.sponsor {
+    p {
+        margin-bottom: 0;
+    }
+    img {
+        height: 45px;
+        position: relative;
+        top: -3px;
+    }
 }
 
 .icon-check:before { content: '\2611'; } /* '☑' */

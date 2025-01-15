@@ -12,36 +12,49 @@
 
 namespace App\Security;
 
+use App\Entity\User;
 use Predis\Client;
+use Predis\Connection\ConnectionException;
 use Predis\Profile\RedisProfile;
-use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\RequestStack;
+use Symfony\Component\Security\Core\Authentication\Token\Storage\TokenStorageInterface;
+use Symfony\Component\Security\Http\Authentication\AuthenticationUtils;
 
 class RecaptchaHelper
 {
-    private const LOGIN_BASE_KEY_IP = 'bf:login:ip:';
-    private const LOGIN_BASE_KEY_USER = 'bf:login:user:';
+    public function __construct(
+        private readonly Client $redisCache,
+        private readonly bool $recaptchaEnabled,
+        private readonly RequestStack $requestStack,
+        private readonly TokenStorageInterface $tokenStorage,
+        private readonly AuthenticationUtils $authenticationUtils,
+    ){}
 
-    private Client $redisCache;
-    private bool $recaptchaEnabled;
-
-    public function __construct(Client $redisCache, bool $recaptchaEnabled)
+    public function buildContext(): RecaptchaContext
     {
-        $this->redisCache = $redisCache;
-        $this->recaptchaEnabled = $recaptchaEnabled;
+        return new RecaptchaContext(
+            $this->requestStack->getMainRequest()?->getClientIp() ?: '',
+            $this->getCurrentUsername(),
+            (bool) $this->requestStack->getMainRequest()?->request->has('g-recaptcha-response'),
+        );
     }
 
-    public function requiresRecaptcha(string $ip, string $username): bool
+    public function requiresRecaptcha(RecaptchaContext $context): bool
     {
         if (!$this->recaptchaEnabled) {
             return false;
         }
 
-        $keys = [self::LOGIN_BASE_KEY_IP . $ip];
-        if ($username) {
-            $keys[] = self::LOGIN_BASE_KEY_USER . strtolower($username);
+        $keys = $context->getRedisKeys();
+        if (!$keys) {
+            return false;
         }
 
-        $result = $this->redisCache->mget($keys);
+        try {
+            $result = $this->redisCache->mget($keys);
+        } catch (ConnectionException) {
+            return false;
+        }
         foreach ($result as $count) {
             if ($count >= 3) {
                 return true;
@@ -51,32 +64,35 @@ class RecaptchaHelper
         return false;
     }
 
-    public function increaseCounter(Request $request): void
+    public function increaseCounter(RecaptchaContext $context): void
     {
         if (!$this->recaptchaEnabled) {
             return;
         }
 
-        $ipKey = self::LOGIN_BASE_KEY_IP . $request->getClientIp();
-        $userKey = $this->getUserKey($request);
         /** @phpstan-ignore-next-line */
-        $this->redisCache->incrFailedLoginCounter($ipKey, $userKey);
+        $this->redisCache->incrFailedLoginCounter(...$context->getRedisKeys());
     }
 
-    public function clearCounter(Request $request): void
+    public function clearCounter(RecaptchaContext $context): void
     {
         if (!$this->recaptchaEnabled) {
             return;
         }
 
-        $userKey = $this->getUserKey($request);
-        $this->redisCache->del([$userKey]);
+        $keys = $context->getRedisKeys(true);
+        if (count($keys) > 0) {
+            $this->redisCache->del($keys);
+        }
     }
 
-    private function getUserKey(Request $request): string
+    private function getCurrentUsername(): string
     {
-        $username = (string) $request->request->get('_username');
+        $user = $this->tokenStorage->getToken()?->getUser();
+        if ($user instanceof User) {
+            return $user->getUsername();
+        }
 
-        return self::LOGIN_BASE_KEY_USER . strtolower($username);
+        return $this->authenticationUtils->getLastUsername();
     }
 }

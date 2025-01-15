@@ -13,6 +13,7 @@
 namespace App\Entity;
 
 use App\Service\UpdaterWorker;
+use App\Util\HttpDownloaderOptionsFactory;
 use App\Validator\PopularPackageSafety;
 use App\Validator\TypoSquatters;
 use App\Validator\Copyright;
@@ -33,6 +34,33 @@ use Composer\Repository\Vcs\GitHubDriver;
 use Composer\Util\HttpDownloader;
 use DateTimeInterface;
 
+enum PackageFreezeReason: string
+{
+    case Spam = 'spam';
+    case RemoteIdMismatch = 'remote_id';
+    case Gone = 'gone';
+
+    public function translationKey(): string
+    {
+        return 'freezing_reasons.' . $this->value;
+    }
+
+    public function isSpam(): bool
+    {
+        return $this === self::Spam;
+    }
+
+    public function isGone(): bool
+    {
+        return $this === self::Gone;
+    }
+
+    public function isRemoteIdMismatch(): bool
+    {
+        return $this === self::RemoteIdMismatch;
+    }
+}
+
 /**
  * @author Jordi Boggiano <j.boggiano@seld.be>
  * @phpstan-import-type VersionArray from Version
@@ -46,8 +74,10 @@ use DateTimeInterface;
 #[ORM\Index(name: 'dumped2_idx', columns: ['dumpedAtV2'])]
 #[ORM\Index(name: 'repository_idx', columns: ['repository'])]
 #[ORM\Index(name: 'remoteid_idx', columns: ['remoteId'])]
-#[ORM\Index(name: 'dumped2_crawled_idx', columns: ['dumpedAtV2', 'crawledAt'])]
+#[ORM\Index(name: 'dumped2_crawled_frozen_idx', columns: ['dumpedAtV2', 'crawledAt', 'frozen'])]
 #[ORM\Index(name: 'vendor_idx', columns: ['vendor'])]
+#[ORM\Index(name: 'frozen_idx', columns: ['frozen'])]
+#[ORM\Index(name: 'type_frozen_idx', columns: ['type', 'frozen'])]
 #[UniquePackage(groups: ['Create'])]
 #[VendorWritable(groups: ['Create'])]
 #[ValidPackageRepository(groups: ['Update', 'Default'])]
@@ -164,6 +194,12 @@ class Package
     private string|null $suspect = null;
 
     /**
+     * If set, the content is the reason for being frozen
+     */
+    #[ORM\Column(nullable: true)]
+    private PackageFreezeReason|null $frozen = null;
+
+    /**
      * @internal
      * @var true|null|\Composer\Repository\Vcs\VcsDriverInterface
      */
@@ -187,6 +223,7 @@ class Package
     }
 
     /**
+     * @param VersionRepository|array<string,VersionArray> $versionRepo Version repo or an already array-ified version dataset
      * @return array{
      *     name: string,
      *     description: string|null,
@@ -203,24 +240,28 @@ class Package
      *     abandoned?: string|true,
      * }
      */
-    public function toArray(VersionRepository $versionRepo, bool $serializeForApi = false): array
+    public function toArray(VersionRepository|array $versionRepo, bool $serializeForApi = false): array
     {
         $maintainers = [];
         foreach ($this->getMaintainers() as $maintainer) {
             $maintainers[] = $maintainer->toArray();
         }
 
-        $versions = [];
-        $partialVersions = $this->getVersions()->toArray();
-        while ($partialVersions) {
-            $versionRepo->getEntityManager()->clear();
+        if (is_array($versionRepo)) {
+            $versions = $versionRepo;
+        } else {
+            $versions = [];
+            $partialVersions = $this->getVersions()->toArray();
+            while ($partialVersions) {
+                $versionRepo->getEntityManager()->clear();
 
-            $slice = array_splice($partialVersions, 0, 100);
-            $fullVersions = $versionRepo->refreshVersions($slice);
-            $versionData = $versionRepo->getVersionData(array_map(static function ($v) {
-                return $v->getId();
-            }, $fullVersions));
-            $versions = array_merge($versions, $versionRepo->detachToArray($fullVersions, $versionData, $serializeForApi));
+                $slice = array_splice($partialVersions, 0, 100);
+                $fullVersions = $versionRepo->refreshVersions($slice);
+                $versionData = $versionRepo->getVersionData(array_map(static function ($v) {
+                    return $v->getId();
+                }, $fullVersions));
+                $versions = array_merge($versions, $versionRepo->detachToArray($fullVersions, $versionData, $serializeForApi));
+            }
         }
 
         $data = [
@@ -267,6 +308,40 @@ class Package
     public function getVendor(): string
     {
         return $this->vendor;
+    }
+
+    /**
+     * @return array<string>|null Vendor and package name
+     */
+    public function getGitHubComponents(): array|null
+    {
+        if (Preg::isMatchStrictGroups('{^(?:git://|git@|https?://)github.com[:/]([^/]+)/(.+?)(?:\.git|/)?$}i', $this->getRepository(), $match)) {
+            return $match;
+        }
+
+        return null;
+    }
+
+    /**
+     * @return array<string>|null Vendor and package name
+     */
+    public function getGitLabComponents(): array|null
+    {
+        if (Preg::isMatchStrictGroups('{^(?:git://|git@|https?://)gitlab.com[:/]([^/]+)/(.+?)(?:\.git|/)?$}i', $this->getRepository(), $match)) {
+            return $match;
+        }
+
+        return null;
+    }
+
+    public function isGitHub(): bool
+    {
+        return (bool) $this->getGitHubComponents();
+    }
+
+    public function isGitLab(): bool
+    {
+        return (bool) $this->getGitLabComponents();
     }
 
     /**
@@ -329,6 +404,18 @@ class Package
         return $this->gitHubStars;
     }
 
+    public function getGitHubStarsUrl(): string|null
+    {
+        if ($this->isGitHub()) {
+            return $this->getBrowsableRepository() . '/stargazers';
+        }
+        if ($this->isGitLab()) {
+            return $this->getBrowsableRepository() . '/-/starrers';
+        }
+
+        return null;
+    }
+
     public function setGitHubWatches(int|null $val): void
     {
         $this->gitHubWatches = $val;
@@ -347,6 +434,18 @@ class Package
     public function getGitHubForks(): int|null
     {
         return $this->gitHubForks;
+    }
+
+    public function getGitHubForksUrl(): string|null
+    {
+        if ($this->isGitHub()) {
+            return $this->getBrowsableRepository() . '/forks';
+        }
+        if ($this->isGitLab()) {
+            return $this->getBrowsableRepository() . '/-/forks';
+        }
+
+        return null;
     }
 
     public function setGitHubOpenIssues(int|null $val): void
@@ -382,9 +481,11 @@ class Package
         $repoUrl = Preg::replace('{^git://github.com/}i', 'https://github.com/', $repoUrl);
         $repoUrl = Preg::replace('{^(https://github.com/.*?)\.git$}i', '$1', $repoUrl);
         $repoUrl = Preg::replace('{^(https://github.com/.*?)/$}i', '$1', $repoUrl);
+        // support urls like https://github.com/foo/bar/tree/main/baz or other sub-URLs in a repo
+        $repoUrl = Preg::replace('{^(https://github.com/[^/]+/[^/]++).+$}i', '$1', $repoUrl);
 
         $repoUrl = Preg::replace('{^git@gitlab.com:}i', 'https://gitlab.com/', $repoUrl);
-        $repoUrl = Preg::replace('{^(https://gitlab.com/.*?)\.git$}i', '$1', $repoUrl);
+        $repoUrl = Preg::replace('{^https?://(?:www\.)?gitlab\.com/(.*?)\.git$}i', 'https://gitlab.com/$1', $repoUrl);
 
         $repoUrl = Preg::replace('{^git@+bitbucket.org:}i', 'https://bitbucket.org/', $repoUrl);
         $repoUrl = Preg::replace('{^bitbucket.org:}i', 'https://bitbucket.org/', $repoUrl);
@@ -416,7 +517,7 @@ class Package
             $io = new NullIO();
             $config = Factory::createConfig();
             $io->loadConfiguration($config);
-            $httpDownloader = new HttpDownloader($io, $config);
+            $httpDownloader = new HttpDownloader($io, $config, HttpDownloaderOptionsFactory::getOptions());
             $repository = new VcsRepository(['url' => $this->repository], $io, $config, $httpDownloader, null, null, UpdaterWorker::VCS_REPO_DRIVERS);
 
             $driver = $this->vcsDriver = $repository->getDriver();
@@ -435,6 +536,11 @@ class Package
                 if ($repoData = $driver->getRepoData()) {
                     $this->remoteId = parse_url($this->repository, PHP_URL_HOST).'/'.$repoData['id'];
                 }
+            }
+
+            // when a package URL is updated to a new one we should assume it is now valid and not gone anymore
+            if ($this->isFrozen() && $this->getFreezeReason() === PackageFreezeReason::Gone) {
+                $this->unfreeze();
             }
         } catch (\Exception $e) {
             $this->vcsDriverError = '['.get_class($e).'] '.$e->getMessage();
@@ -462,7 +568,15 @@ class Package
             return Preg::replace('{^(?:git@|https://|git://)bitbucket.org[:/](.+?)(?:\.git)?$}i', 'https://bitbucket.org/$1', $this->repository);
         }
 
-        return Preg::replace('{^(git://github.com/|git@github.com:)}', 'https://github.com/', $this->repository);
+        if (Preg::isMatch('{(://|@)github.com[:/]}i', $this->repository)) {
+            return Preg::replace('{^(git://github.com/|git@github.com:)}', 'https://github.com/', $this->repository);
+        }
+
+        if (Preg::isMatch('{(://|@)gitlab.com[:/]}i', $this->repository)) {
+            return Preg::replace('{^(git://gitlab.com/|git@gitlab.com:)}', 'https://gitlab.com/', $this->repository);
+        }
+
+        return $this->repository;
     }
 
     public function addVersion(Version $version): void
@@ -507,7 +621,7 @@ class Package
 
     public function wasUpdatedInTheLast24Hours(): bool
     {
-        return $this->updatedAt && $this->updatedAt > new \DateTime('-24 hours');
+        return $this->updatedAt && $this->updatedAt > new \DateTimeImmutable('-24 hours');
     }
 
     public function setCrawledAt(?DateTimeInterface $crawledAt): void
@@ -582,6 +696,25 @@ class Package
         return $this->type;
     }
 
+    public function getInstallCommand(Version $version = null): string
+    {
+        if (in_array($this->getType(), ['php-ext', 'php-ext-zend'], true)) {
+            return 'pie install '.$this->getName();
+        }
+
+        $command = 'create-project';
+
+        if ('project' !== $this->getType()) {
+            $command = 'require';
+
+            if (null !== $version && $version->hasDevTag()) {
+                $command .= ' --dev';
+            }
+        }
+
+        return sprintf('composer %s %s', $command, $this->getName());
+    }
+
     public function setRemoteId(string|null $remoteId): void
     {
         $this->remoteId = $remoteId;
@@ -647,6 +780,34 @@ class Package
     public function getSuspect(): ?string
     {
         return $this->suspect;
+    }
+
+    public function freeze(PackageFreezeReason $reason): void
+    {
+        $this->frozen = $reason;
+        // force re-indexing for spam packages to ensure they get deleted from the search index
+        if ($reason === PackageFreezeReason::Spam) {
+            $this->setIndexedAt(null);
+        }
+    }
+
+    public function unfreeze(): void
+    {
+        if ($this->frozen === PackageFreezeReason::RemoteIdMismatch) {
+            $this->setRemoteId(null);
+        }
+        $this->frozen = null;
+        $this->setCrawledAt(null);
+    }
+
+    public function isFrozen(): bool
+    {
+        return !is_null($this->frozen);
+    }
+
+    public function getFreezeReason(): ?PackageFreezeReason
+    {
+        return $this->frozen;
     }
 
     public function isAbandoned(): bool

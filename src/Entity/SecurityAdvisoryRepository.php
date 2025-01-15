@@ -14,6 +14,7 @@ namespace App\Entity;
 
 use App\SecurityAdvisory\FriendsOfPhpSecurityAdvisoriesSource;
 use Doctrine\Bundle\DoctrineBundle\Repository\ServiceEntityRepository;
+use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
 use Doctrine\Persistence\ManagerRegistry;
 use Predis\Client;
@@ -46,7 +47,7 @@ class SecurityAdvisoryRepository extends ServiceEntityRepository
             ->innerJoin('a.sources', 's')
             ->innerJoin('a.sources', 'query')
             ->where('query.source = :source OR a.packageName IN (:packageNames)')
-            ->setParameter('packageNames', $packageNames, Connection::PARAM_STR_ARRAY)
+            ->setParameter('packageNames', $packageNames, ArrayParameterType::STRING)
             ->setParameter('source', $sourceName)
             ->getQuery()
             ->getResult();
@@ -76,6 +77,38 @@ class SecurityAdvisoryRepository extends ServiceEntityRepository
             ->createQueryBuilder('a')
             ->addSelect('s')
             ->leftJoin('a.sources', 's')
+            ->getQuery()
+            ->getResult();
+    }
+
+    /**
+     * @return list<SecurityAdvisory>
+     */
+    public function findByRemoteId(string $source, string $id): array
+    {
+        return $this
+            ->createQueryBuilder('a')
+            ->addSelect('s')
+            ->leftJoin('a.sources', 's')
+            ->where('s.source = :source')
+            ->andWhere('s.remoteId = :id')
+            ->setParameters(['source' => $source, 'id' => $id])
+            ->getQuery()
+            ->getResult();
+    }
+
+    /**
+     * @return list<SecurityAdvisory>
+     */
+    public function findByPackageName(string $packageName): array
+    {
+        return $this
+            ->createQueryBuilder('a')
+            ->addSelect('s')
+            ->leftJoin('a.sources', 's')
+            ->where('a.packageName = :packageName')
+            ->orderBy('a.reportedAt', 'DESC')
+            ->setParameters(['packageName' => $packageName])
             ->getQuery()
             ->getResult();
     }
@@ -119,7 +152,7 @@ class SecurityAdvisoryRepository extends ServiceEntityRepository
         }
 
         if (!$useCache || $filterByNames) {
-            $sql = 'SELECT s.packagistAdvisoryId as advisoryId, s.packageName, s.remoteId, s.title, s.link, s.cve, s.affectedVersions, s.source, s.reportedAt, s.composerRepository, sa.source sourceSource, sa.remoteId sourceRemoteId
+            $sql = 'SELECT s.packagistAdvisoryId as advisoryId, s.packageName, s.remoteId, s.title, s.link, s.cve, s.affectedVersions, s.source, s.reportedAt, s.composerRepository, sa.source sourceSource, sa.remoteId sourceRemoteId, s.severity
                 FROM security_advisory s
                 INNER JOIN security_advisory_source sa ON sa.securityAdvisory_id=s.id
                 WHERE s.updatedAt >= :updatedSince '.
@@ -130,7 +163,7 @@ class SecurityAdvisoryRepository extends ServiceEntityRepository
             $types = [];
             if ($filterByNames) {
                 $params['packageNames'] = $packageNames;
-                $types['packageNames'] = Connection::PARAM_STR_ARRAY;
+                $types['packageNames'] = ArrayParameterType::STRING;
             }
 
             $result = $this->getEntityManager()->getConnection()->fetchAllAssociative($sql, $params, $types);
@@ -173,12 +206,12 @@ class SecurityAdvisoryRepository extends ServiceEntityRepository
             ORDER BY s.id DESC';
 
         $params['packageNames'] = $packageNames;
-        $types['packageNames'] = Connection::PARAM_STR_ARRAY;
+        $types['packageNames'] = ArrayParameterType::STRING;
 
         $rows = $this->getEntityManager()->getConnection()->fetchAllAssociative(
             $sql,
             ['packageNames' => $packageNames],
-            ['packageNames' => Connection::PARAM_STR_ARRAY]
+            ['packageNames' => ArrayParameterType::STRING]
         );
 
         $results = [];

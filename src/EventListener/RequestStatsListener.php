@@ -12,10 +12,15 @@
 
 namespace App\EventListener;
 
+use App\Logger\LogIdProcessor;
 use Graze\DogStatsD\Client;
+use Monolog\Logger;
+use Monolog\LogRecord;
 use Symfony\Component\EventDispatcher\Attribute\AsEventListener;
+use Symfony\Component\HttpKernel\Event\ExceptionEvent;
 use Symfony\Component\HttpKernel\Event\RequestEvent;
 use Symfony\Component\HttpKernel\Event\ResponseEvent;
+use Symfony\Component\HttpKernel\Exception\BadRequestHttpException;
 
 class RequestStatsListener
 {
@@ -23,19 +28,26 @@ class RequestStatsListener
 
     public function __construct(
         private Client $statsd,
+        private Logger $logger,
+        private LogIdProcessor $logIdProcessor,
     ) {
     }
 
-    #[AsEventListener]
+    #[AsEventListener(priority: 1000)]
     public function onRequest(RequestEvent $e): void
     {
         if (!$e->isMainRequest()) {
             return;
         }
         $this->pageTiming = microtime(true);
+
+        $this->logIdProcessor->startRequest();
+        if ($e->getRequest()->getContent() !== null) {
+            $this->logger->debug('Request content received', ['content' => substr($e->getRequest()->getContent(), 0, 10_000)]);
+        }
     }
 
-    #[AsEventListener]
+    #[AsEventListener(priority: -1000)]
     public function onResponse(ResponseEvent $e): void
     {
         if (!$e->isMainRequest()) {
@@ -58,5 +70,13 @@ class RequestStatsListener
             default => '5xx',
         };
         $this->statsd->increment('app.status.'.$statsdCode, 1, 1, ['route' => $e->getRequest()->attributes->get('_route')]);
+    }
+
+    #[AsEventListener()]
+    public function onException(ExceptionEvent $e): void
+    {
+        if ($e->getThrowable() instanceof BadRequestHttpException && $e->getThrowable()->getCode() !== 404) {
+            $this->logger->error('Bad request', ['exception' => $e->getThrowable()]);
+        }
     }
 }

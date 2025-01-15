@@ -25,7 +25,7 @@ use Symfony\Component\Validator\Constraints\NotBlank;
 use Symfony\Component\Form\Extension\Core\Type\PasswordType;
 
 /**
- * @author Jordi Boggiano <j.boggiano@seld.be>
+ * @extends AbstractType<User>
  */
 class ProfileFormType extends AbstractType
 {
@@ -40,22 +40,25 @@ class ProfileFormType extends AbstractType
                 }
 
                 if (!$user->getGithubId()) {
-                    $event->getForm()->add('current_password', PasswordType::class, [
-                        'label' => 'Current password',
-                        'translation_domain' => 'FOSUserBundle',
-                        'mapped' => false,
-                        'constraints' => [
-                            new NotBlank(),
-                            new UserPassword(),
-                        ],
-                        'attr' => [
-                            'autocomplete' => 'current-password',
-                        ],
-                    ]);
+                    $event->getForm()
+                        ->add('current_password', PasswordType::class, [
+                            'label' => 'Current password',
+                            'translation_domain' => 'FOSUserBundle',
+                            'mapped' => false,
+                            'constraints' => [
+                                new NotBlank(),
+                                new UserPassword(),
+                            ],
+                            'attr' => [
+                                'autocomplete' => 'current-password',
+                            ],
+                        ])
+                        ->add('captcha', InvisibleRecaptchaType::class, ['only_show_after_increment_trigger' => true]);
                 }
             });
 
-        $builder->add('failureNotifications', null, ['required' => false, 'label' => 'Notify me of package update failures']);
+        $builder
+            ->add('failureNotifications', null, ['required' => false, 'label' => 'Notify me of package update failures']);
     }
 
     public function configureOptions(OptionsResolver $resolver): void

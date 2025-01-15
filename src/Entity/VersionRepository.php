@@ -13,6 +13,7 @@
 namespace App\Entity;
 
 use App\Model\VersionIdCache;
+use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Cache\QueryCacheProfile;
 use Doctrine\DBAL\Connection;
 use Doctrine\ORM\EntityManagerInterface;
@@ -47,8 +48,8 @@ class VersionRepository extends ServiceEntityRepository
         $em = $this->getEntityManager();
         $package = $version->getPackage();
         $package->getVersions()->removeElement($version);
-        $package->setCrawledAt(new \DateTime);
-        $package->setUpdatedAt(new \DateTime);
+        $package->setCrawledAt(new \DateTimeImmutable());
+        $package->setUpdatedAt(new \DateTimeImmutable());
         $em->persist($package);
 
         $this->versionIdCache->deleteVersion($package, $version);
@@ -139,7 +140,7 @@ class VersionRepository extends ServiceEntityRepository
             $rows = $this->getEntityManager()->getConnection()->fetchAllAssociative(
                 'SELECT version_id, packageName name, packageVersion version FROM '.$table.' WHERE version_id IN (:ids)',
                 ['ids' => $versionIds],
-                ['ids' => Connection::PARAM_INT_ARRAY]
+                ['ids' => ArrayParameterType::INTEGER]
             );
             foreach ($rows as $row) {
                 $result[$row['version_id']][$link][] = $row;
@@ -149,7 +150,7 @@ class VersionRepository extends ServiceEntityRepository
         $rows = $this->getEntityManager()->getConnection()->fetchAllAssociative(
             'SELECT vt.version_id, name FROM tag t JOIN version_tag vt ON vt.tag_id = t.id WHERE vt.version_id IN (:ids)',
             ['ids' => $versionIds],
-            ['ids' => Connection::PARAM_INT_ARRAY]
+            ['ids' => ArrayParameterType::INTEGER]
         );
         foreach ($rows as $row) {
             $versionId = $row['version_id'];
@@ -261,7 +262,7 @@ class VersionRepository extends ServiceEntityRepository
                 $sql,
                 [],
                 [],
-                new QueryCacheProfile(86400, 'total_package_versions', $this->getEntityManager()->getConfiguration()->getResultCacheImpl())
+                new QueryCacheProfile(86400, 'total_package_versions', $this->getEntityManager()->getConfiguration()->getResultCache())
             );
         $result = $stmt->fetchAllAssociative();
         $stmt->free();
@@ -281,7 +282,7 @@ class VersionRepository extends ServiceEntityRepository
                 $sql,
                 [],
                 [],
-                new QueryCacheProfile(3600, 'package_versions_count_by_year_month', $this->getEntityManager()->getConfiguration()->getResultCacheImpl())
+                new QueryCacheProfile(3600, 'package_versions_count_by_year_month', $this->getEntityManager()->getConfiguration()->getResultCache())
             );
         $result = $stmt->fetchAllAssociative();
         $stmt->free();

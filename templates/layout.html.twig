@@ -22,38 +22,35 @@
 
         <link rel="search" type="application/opensearchdescription+xml" href="{{ asset('search.osd') }}" title="Packagist" />
 
-        {% if requiresRecaptcha|default(false) or (not app.user and requires_recaptcha(lastUsername|default)) %}
+        <script nonce="{{ csp_nonce('script') }}">
+            var onloadRecaptchaCallback = function() {
+                document.querySelectorAll('.recaptcha-protected').forEach((el) => {
+                    el.closest('form').querySelectorAll('button, input[type="submit"]').forEach((submit) => {
+                        grecaptcha.render(submit, {
+                            'sitekey' : '{{ recaptcha_site_key }}',
+                            'callback' : function (token) {
+                                submit.form.submit();
+                            }
+                        });
+                    })
+                });
+            };
+        </script>
+        {% if requiresRecaptcha|default(false) %}
             <script nonce="{{ csp_nonce('script') }}" src="https://www.google.com/recaptcha/api.js?render=explicit&amp;onload=onloadRecaptchaCallback" async defer></script>
-
-            <script nonce="{{ csp_nonce('script') }}">
-                var onloadRecaptchaCallback = function() {
-                    const forms = [
-                        {submit: '_submit', form: 'page_login'},
-                        {submit: '_request_password_submit', form: 'request_password'},
-                        {submit: '_register_submit', form: 'register_form'},
-                        {submit: '_submit_mini', form: 'nav_login'},
-                    ];
-
-                    forms.forEach(({submit, form}) => {
-                        if (document.getElementById(submit)) {
-                            grecaptcha.render(submit, {
-                                'sitekey' : '{{ recaptcha_site_key }}',
-                                'callback' : function (token) {
-                                    document.getElementById(form).submit();
-                                }
-                            });
-                        }
-                    });
-                };
-            </script>
         {% endif %}
 
         {% block head_additions %}{% endblock %}
     </head>
-
     <body>
     <section class="wrap">
         <header class="navbar-wrapper navbar-fixed-top">
+            {% if 'now'|date('Ymd') < '20251001' %}
+            <section class="banner alert-error hidden">
+                Composer v1 support is <a href="https://blog.packagist.com/shutting-down-packagist-org-support-for-composer-1-x/">coming to an end</a>
+                <i class="glyphicon glyphicon-remove banner-close" data-banner-id="composer1eol"></i>
+            </section>
+            {% endif %}
             <nav class="container">
                 <div class="navbar" role="navigation">
                     <div class="navbar-header">
@@ -86,7 +83,7 @@
                             </li>
                             <li class="nav-user visible-xs-block">
                                 <section>
-                                    <a href="{{ path('logout') }}">Log out</a>
+                                    <a href="{{ logout_path() }}">Log out</a>
                                 </section>
                             </li>
                         {%- else %}
@@ -198,34 +195,39 @@
                         <li><a href="mailto:contact@packagist.org" title="{{ 'menu.contact'|trans }}"><span class="icon-mail"></span></a></li>
                     </ul>
 
-                    <ul class="col-xs-4 col-md-2">
+                    <ul class="col-xs-4 col-sm-4 col-md-2">
                         <li><a href="{{ path('about') }}">{{ 'menu.about_packagist'|trans }}</a></li>
                         <li><a href="{{ path('feeds') }}" rel="nofollow">{{ 'menu.rss_feeds'|trans }}</a></li>
                     </ul>
 
                     <div class="clearfix visible-xs-block"></div>
 
-                    <ul class="col-xs-3 col-md-2">
+                    <ul class="col-xs-3 col-sm-4 col-md-2">
                         <li><a href="{{ path('stats') }}" rel="nofollow">{{ 'menu.stats'|trans }}</a></li>
                         <li><a href="{{ path('browse') }}">{{ 'menu.browse_packages'|trans }}</a></li>
                     </ul>
 
-                    <div class="clearfix visible-xs-block"></div>
+                    <div class="clearfix visible-xs-block visible-sm-block"></div>
 
-                    <ul class="col-xs-3 col-md-2">
+                    <ul class="col-xs-3 col-sm-4 col-md-2">
                         <li><a href="{{ path('api_doc') }}">{{ 'menu.api_doc'|trans }}</a></li>
                         <li><a href="{{ path('mirrors') }}">{{ 'menu.mirrors'|trans }}</a></li>
                     </ul>
 
                     <div class="clearfix visible-xs-block"></div>
 
-                    <ul class="col-xs-3 col-md-2">
+                    <ul class="col-xs-3 col-sm-4 col-md-2">
                         <li><a href="https://status.packagist.org/">Status</a></li>
+                        <li><a href="https://p.datadoghq.com/sb/x98w56x71erzshui-4a54c45f82bacc991e83302548934b6a">Dashboard</a></li>
                     </ul>
                 </div>
 
-                <div class="row">
-                    <p class="toran col-xs-12">Packagist maintenance and hosting is provided by <a href="https://packagist.com/">Private Packagist</a></p>
+                <div class="row sponsor">
+                    <p class="col-xs-12">Packagist maintenance and hosting provided by <a href="https://packagist.com/"><img alt="Private Packagist" src="{{ asset('img/private-packagist.svg') }}" /></a></p>
+                </div>
+
+                <div class="row sponsor">
+                    <p class="col-xs-12">Monitoring provided by <a href="https://datadog.com/"><img alt="Datadog" src="{{ asset('img/datadog-light.png') }}" /></a></p>
                 </div>
             </nav>
         </footer>
