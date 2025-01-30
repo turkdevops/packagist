@@ -13,6 +13,8 @@
 namespace App\Form;
 
 use App\Entity\User;
+use App\Form\Type\InvisibleRecaptchaType;
+use App\Validator\NotProhibitedPassword;
 use App\Validator\Password;
 use Symfony\Component\Form\AbstractType;
 use Symfony\Component\Form\Extension\Core\Type\PasswordType;
@@ -21,6 +23,9 @@ use Symfony\Component\OptionsResolver\OptionsResolver;
 use Symfony\Component\Security\Core\Validator\Constraints\UserPassword;
 use Symfony\Component\Validator\Constraints\NotBlank;
 
+/**
+ * @extends AbstractType<User>
+ */
 class ChangePasswordFormType extends AbstractType
 {
     public function buildForm(FormBuilderInterface $builder, array $options): void
@@ -46,6 +51,7 @@ class ChangePasswordFormType extends AbstractType
                     new Password(),
                 ],
             ])
+            ->add('captcha', InvisibleRecaptchaType::class, ['only_show_after_increment_trigger' => true])
         ;
     }
 
@@ -53,6 +59,7 @@ class ChangePasswordFormType extends AbstractType
     {
         $resolver->setDefaults([
             'data_class' => User::class,
+            'constraints' => [new NotProhibitedPassword()],
         ]);
     }
 }

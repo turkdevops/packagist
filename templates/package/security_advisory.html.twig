@@ -1,0 +1,21 @@
+{% extends "layout.html.twig" %}
+
+{% set showSearchDesc = 'hide' %}
+
+{% block head_additions %}<meta name="robots" content="noindex, nofollow">{% endblock %}
+
+{% block title %}{{ 'packages.security_advisory_title'|trans }} - {{ id }} - {{ parent() }}{% endblock %}
+
+{% block content %}
+    <div class="row">
+        <div class="col-xs-12 package">
+            <div class="package-header">
+                <h2 class="title">
+                    {{ id }} Security Advisory
+                </h2>
+            </div>
+        </div>
+    </div>
+
+    {% include 'package/_security_advisory_list.html.twig' with {withPackage: true} %}
+{% endblock %}

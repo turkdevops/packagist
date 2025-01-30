@@ -13,16 +13,16 @@
 namespace App\Controller;
 
 use App\Entity\User;
+use App\Security\UserNotifier;
 use App\Service\Scheduler;
 use KnpU\OAuth2ClientBundle\Client\ClientRegistry;
 use KnpU\OAuth2ClientBundle\Exception\InvalidStateException;
 use League\OAuth2\Client\Provider\Exception\IdentityProviderException;
 use League\OAuth2\Client\Provider\GithubResourceOwner;
 use League\OAuth2\Client\Token\AccessToken;
-use Symfony\Component\Finder\Exception\AccessDeniedException;
 use Symfony\Component\HttpFoundation\RedirectResponse;
 use Symfony\Component\HttpFoundation\Request;
-use Symfony\Component\Routing\Annotation\Route;
+use Symfony\Component\Routing\Attribute\Route;
 use Symfony\Component\Routing\Generator\UrlGeneratorInterface;
 use Symfony\Component\Security\Csrf\CsrfTokenManagerInterface;
 use Symfony\Component\Security\Http\Attribute\CurrentUser;
@@ -72,7 +72,7 @@ class GitHubLoginController extends Controller
      * in config/packages/knpu_oauth2_client.yaml
      */
     #[Route(path: '/connect/github/check', name: 'connect_github_check')]
-    public function connectCheck(Request $request, ClientRegistry $clientRegistry, Scheduler $scheduler, #[CurrentUser] User $user): RedirectResponse
+    public function connectCheck(Request $request, ClientRegistry $clientRegistry, Scheduler $scheduler, UserNotifier $userNotifier, #[CurrentUser] User $user): RedirectResponse
     {
         /** @var \KnpU\OAuth2ClientBundle\Client\Provider\GithubClient $client */
         $client = $clientRegistry->getClient('github');
@@ -113,8 +113,9 @@ class GitHubLoginController extends Controller
             $this->getEM()->flush();
 
             $scheduler->scheduleUserScopeMigration($user->getId(), $oldScope, $user->getGithubScope() ?? '');
+            $userNotifier->notifyChange($user->getEmail(), 'A GitHub account ('.$ghUser->getNickname().') has been connected to your Packagist.org account.');
 
-            $this->addFlash('success', 'You have connected your GitHub account '.$ghUser->getNickname().' to your Packagist.org account.');
+            $this->addFlash('success', 'You have connected your GitHub account ('.$ghUser->getNickname().') to your Packagist.org account.');
         } catch (IdentityProviderException | InvalidStateException $e) {
             $this->addFlash('error', 'Failed OAuth Login: '.$e->getMessage());
         }
@@ -133,16 +134,17 @@ class GitHubLoginController extends Controller
     }
 
     #[Route(path: '/oauth/github/disconnect', name: 'user_github_disconnect')]
-    public function disconnect(Request $req, CsrfTokenManagerInterface $csrfTokenManager, #[CurrentUser] User $user): RedirectResponse
+    public function disconnect(Request $req, CsrfTokenManagerInterface $csrfTokenManager, UserNotifier $userNotifier, #[CurrentUser] User $user): RedirectResponse
     {
         if (!$this->isCsrfTokenValid('unlink_github', $req->query->get('token', ''))) {
-            throw new AccessDeniedException('Invalid CSRF token');
+            throw $this->createAccessDeniedException('Invalid CSRF token');
         }
 
         if ($user->getGithubId()) {
             $this->disconnectUser($user);
             $this->getEM()->persist($user);
             $this->getEM()->flush();
+            $userNotifier->notifyChange($user->getEmail(), 'Your GitHub account has been disconnected from your Packagist.org account.');
         }
 
         return $this->redirectToRoute('edit_profile');

@@ -38,18 +38,23 @@ import 'bootstrap';
     /**
      * API Token visibility toggling
      */
-    var token = $('#api-token');
-    token.val('');
-
-    $('.btn-show-api-token,#api-token').each(function() {
+    $('.btn-show-api-token, .api-token').each(function() {
         $(this).click(function (e) {
+            const parent = $(this).closest('.api-token-group');
+            const token = parent.find('.api-token');
             token.val(token.data('api-token'));
             token.select();
 
-            $('.btn-show-api-token').text('Your API token');
+            const button = parent.find('.btn-show-api-token').first();
+            button.text(button.text().replace('Show', 'Your'));
 
             e.preventDefault();
         });
+    });
+    $('.btn-rotate-api-token').click(function (e) {
+        if (!window.confirm('Are you sure? This will revoke your current API tokens and generate new ones.')) {
+            e.preventDefault();
+        }
     });
 
     $('.toc a').click(function (e) {
@@ -57,6 +62,21 @@ import 'bootstrap';
             scrollTo(0, $($(e.target).attr('href')).offset().top - 65);
         }, 0);
     });
+
+    let currentBannerId = $('.banner .banner-close').data('banner-id');
+    $('.banner .banner-close').click(function () {
+        $('.banner').addClass('hidden');
+        try {
+            window.localStorage.setItem('banner-read', currentBannerId);
+        } catch (e) {}
+    });
+    if (currentBannerId !== undefined) {
+        try {
+            if (window.localStorage.getItem('banner-read') !== currentBannerId) {
+                $('.banner').removeClass('hidden');
+            }
+        } catch (e) {}
+    }
 })(jQuery);
 
 if (window.trackPageload !== false && location.host === 'packagist.org') {

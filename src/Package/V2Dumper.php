@@ -12,8 +12,10 @@
 
 namespace App\Package;
 
+use App\Entity\PackageFreezeReason;
 use App\Entity\SecurityAdvisory;
 use Composer\Pcre\Preg;
+use Doctrine\DBAL\ArrayParameterType;
 use Symfony\Component\Filesystem\Filesystem;
 use Composer\MetadataMinifier\MetadataMinifier;
 use Doctrine\Persistence\ManagerRegistry;
@@ -57,7 +59,7 @@ class V2Dumper
     /**
      * Dump a set of packages to the web root
      *
-     * @param int[] $packageIds
+     * @param list<int> $packageIds
      */
     public function dump(array $packageIds, bool $force = false, bool $verbose = false): void
     {
@@ -110,9 +112,8 @@ class V2Dumper
 
             // prepare packages in memory
             foreach ($packages as $package) {
-                // skip spam packages in the dumper in case we do a forced full dump and prevent them from being dumped for a little while
-                if ($package->isAbandoned() && $package->getReplacementPackage() === 'spam/spam') {
-                    $dumpTimeUpdates['2100-01-01 00:00:00'][] = $package->getId();
+                // skip spam packages in the dumper in case one appears due to a race condition
+                if ($package->isFrozen() && $package->getFreezeReason() === PackageFreezeReason::Spam) {
                     continue;
                 }
 
@@ -159,7 +160,7 @@ class V2Dumper
                             'ids' => $ids,
                             'dumped' => $dt,
                         ],
-                        ['ids' => Connection::PARAM_INT_ARRAY]
+                        ['ids' => ArrayParameterType::INTEGER]
                     );
                     break;
                 } catch (\Exception $e) {
@@ -222,12 +223,8 @@ class V2Dumper
         $name = strtolower($package->getName());
         $forceDump = $package->getDumpedAtV2() === null;
 
-        $versions = $package->getVersions();
-        if (is_object($versions)) {
-            $versions = $versions->toArray();
-        }
-
-        usort($versions, Package::class.'::sortVersions');
+        $versions = $package->getVersions()->toArray();
+        usort($versions, Package::sortVersions(...));
 
         $tags = [];
         $branches = [];

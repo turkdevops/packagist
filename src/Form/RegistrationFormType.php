@@ -13,6 +13,8 @@
 namespace App\Form;
 
 use App\Entity\User;
+use App\Form\Type\InvisibleRecaptchaType;
+use App\Validator\NotProhibitedPassword;
 use App\Validator\Password;
 use Symfony\Component\Form\AbstractType;
 use Symfony\Component\Form\Extension\Core\Type\CheckboxType;
@@ -22,13 +24,16 @@ use Symfony\Component\Form\FormBuilderInterface;
 use Symfony\Component\OptionsResolver\OptionsResolver;
 use Symfony\Component\Validator\Constraints\IsTrue;
 
+/**
+ * @extends AbstractType<User>
+ */
 class RegistrationFormType extends AbstractType
 {
     public function buildForm(FormBuilderInterface $builder, array $options): void
     {
         $builder
-            ->add('email', EmailType::class)
-            ->add('username')
+            ->add('email', EmailType::class, ['empty_data' => ''])
+            ->add('username', options: ['empty_data' => ''])
 //            ->add('agreeTerms', CheckboxType::class, [
 //                'mapped' => false,
 //                'constraints' => [
@@ -45,6 +50,7 @@ class RegistrationFormType extends AbstractType
                     new Password(),
                 ],
             ])
+            ->add('captcha', InvisibleRecaptchaType::class)
         ;
     }
 
@@ -53,6 +59,7 @@ class RegistrationFormType extends AbstractType
         $resolver->setDefaults([
             'data_class' => User::class,
             'validation_groups' => ['Default', 'Registration'],
+            'constraints' => [new NotProhibitedPassword()],
         ]);
     }
 }

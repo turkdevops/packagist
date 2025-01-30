@@ -12,18 +12,18 @@ jobs:
   tests:
     name: "CI"
 
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
 
     steps:
       - name: "Checkout"
-        uses: "actions/checkout@v3"
+        uses: "actions/checkout@v4"
 
       - name: "Install PHP"
         uses: "shivammathur/setup-php@v2"
         with:
           coverage: "none"
           extensions: "intl, zip, apcu"
-          php-version: "8.1"
+          php-version: "8.3"
           tools: composer
           ini-values: apc.enable_cli=1
 
@@ -31,12 +31,12 @@ jobs:
         run: sudo systemctl start mysql.service
 
       - name: "Install dependencies"
-        uses: "ramsey/composer-install@v2"
+        uses: "ramsey/composer-install@v3"
         with:
             composer-options: "--ansi --no-interaction --no-progress --prefer-dist"
 
       - name: Start Redis
-        uses: supercharge/redis-github-action@1.2.0
+        uses: supercharge/redis-github-action@1.8.0
         with:
           redis-version: 6
 

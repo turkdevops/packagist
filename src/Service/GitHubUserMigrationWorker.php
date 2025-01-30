@@ -43,19 +43,7 @@ class GitHubUserMigrationWorker
 
     /**
      * @param Job<GitHubUserMigrateJob> $job
-     * @return array{
-     *     status: Job::STATUS_*,
-     *     message: string,
-     *     after?: \DateTime,
-     *     results?: array{
-     *         hooks_setup: int,
-     *         hooks_failed: array<int, array{
-     *             package: string,
-     *             reason: mixed
-     *         }>,
-     *         hooks_ok_unchanged: int
-     *     }
-     * }
+     * @return GenericCompletedResult|GitHubMigrationFailedResult|RescheduleResult|GitHubMigrationResult
      */
     public function process(Job $job, SignalHandler $signal): array
     {
@@ -73,7 +61,7 @@ class GitHubUserMigrationWorker
         if (null === $user->getGithubToken()) {
             $this->logger->info('User has no GitHub token setup, skipping', ['id' => $id]);
 
-            return ['status' => Job::STATUS_ERRORED, 'message' => 'User has no GitHub token setup, skipped'];
+            return ['status' => Job::STATUS_FAILED, 'message' => 'User has no GitHub token setup, skipped'];
         }
 
         try {
@@ -174,7 +162,8 @@ class GitHubUserMigrationWorker
             if (count($hooks) && !Preg::isMatch('{^https://api\.github\.com/repos/'.$repoKey.'/hooks/}', $hooks[0]['url'])) {
                 if (Preg::isMatch('{https://api\.github\.com/repos/([^/]+/[^/]+)/hooks}', $hooks[0]['url'], $match)) {
                     $package->setRepository('https://github.com/'.$match[1]);
-                    $this->getEM()->flush($package);
+                    $this->getEM()->persist($package);
+                    $this->getEM()->flush();
                 }
             }
         } catch (HttpExceptionInterface $e) {

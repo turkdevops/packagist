@@ -76,7 +76,7 @@ class SecurityAdvisoryResolverTest extends TestCase
     public function testResolveDontRemoveAdvisoryWithMultipleSources(): void
     {
         $advisory = new SecurityAdvisory($this->createRemoteAdvisory('test'), 'test');
-        $advisory->addSource('other-id', 'other');
+        $advisory->addSource('other-id', 'other', null);
         [$new, $removed] = $this->resolver->resolve([$advisory], new RemoteSecurityAdvisoryCollection([]), 'test');
 
         $this->assertSame([], $new);
@@ -98,6 +98,18 @@ class SecurityAdvisoryResolverTest extends TestCase
         $this->assertNotNull($advisory->getSourceRemoteId('other'));
     }
 
+    public function testResolveRemoteIdChangedSameCve(): void
+    {
+        $remoteAdvisory = $this->createRemoteAdvisory('test', cve: 'CVE-2024-9999999999');
+        $advisory = new SecurityAdvisory($this->createRemoteAdvisory('test', cve: 'CVE-2024-9999999999'), 'test');
+        [$new, $removed] = $this->resolver->resolve([$advisory], new RemoteSecurityAdvisoryCollection([$remoteAdvisory]), 'test');
+
+        $this->assertSame([], $new);
+        $this->assertSame([], $removed);
+
+        $this->assertSame($remoteAdvisory->id, $advisory->getSourceRemoteId('test'));
+    }
+
     public function testResolveEmpty(): void
     {
         [$new, $removed] = $this->resolver->resolve([], new RemoteSecurityAdvisoryCollection([]), 'test');
@@ -108,6 +120,18 @@ class SecurityAdvisoryResolverTest extends TestCase
 
     private function createRemoteAdvisory(string $source, string $packageName = 'acme/package', ?string $cve = null): RemoteSecurityAdvisory
     {
-        return new RemoteSecurityAdvisory(uniqid('id-'), 'Security Advisory', $packageName, '^1.0', 'https://example.org', $cve, new \DateTimeImmutable(), null, [], $source);
+        return new RemoteSecurityAdvisory(
+            uniqid('id-'),
+            'Security Advisory',
+            $packageName,
+            '^1.0',
+            'https://example.org',
+            $cve,
+            new \DateTimeImmutable(),
+            null,
+            [],
+            $source,
+            null,
+        );
     }
 }

@@ -12,7 +12,9 @@
 
 namespace App\Package;
 
+use App\Entity\PackageFreezeReason;
 use Composer\Pcre\Preg;
+use Doctrine\DBAL\ArrayParameterType;
 use Seld\Signal\SignalHandler;
 use Symfony\Component\Filesystem\Filesystem;
 use Composer\Util\Filesystem as ComposerFilesystem;
@@ -93,7 +95,7 @@ class SymlinkDumper
     /**
      * Dump a set of packages to the web root
      *
-     * @param int[]   $packageIds
+     * @param list<int> $packageIds
      */
     public function dump(array $packageIds, bool $force = false, bool $verbose = false, ?SignalHandler $signal = null): bool
     {
@@ -192,9 +194,8 @@ class SymlinkDumper
 
                 // prepare packages in memory
                 foreach ($packages as $package) {
-                    // skip spam packages in the dumper in case we do a forced full dump and prevent them from being dumped for a little while
-                    if ($package->isAbandoned() && $package->getReplacementPackage() === 'spam/spam') {
-                        $dumpTimeUpdates['2100-01-01 00:00:00'][] = $package->getId();
+                    // skip spam packages in the dumper in case one appears due to a race condition
+                    if ($package->isFrozen() && $package->getFreezeReason() === PackageFreezeReason::Spam) {
                         continue;
                     }
 
@@ -312,12 +313,10 @@ class SymlinkDumper
             $this->rootFile['security-advisories'] = [
                 'metadata' => true, // whether advisories are part of the metadata v2 files
                 'api-url' => $this->router->generate('api_security_advisories', [], UrlGeneratorInterface::ABSOLUTE_URL),
-                'query-all' => true, // whether packages that are not part of the repo can be searched in the API
             ];
             $this->rootFile['providers-api'] = str_replace('VND/PKG', '%package%', $this->router->generate('view_providers', ['name' => 'VND/PKG', '_format' => 'json'], UrlGeneratorInterface::ABSOLUTE_URL));
-            $this->rootFile['warning'] = 'Support for Composer 1 is deprecated and some packages will not be available. You should upgrade to Composer 2. See https://blog.packagist.com/deprecating-composer-1-support/';
+            $this->rootFile['warning'] = 'Support for Composer 1 will be shutdown on August 1st 2025. You should upgrade to Composer 2. See https://blog.packagist.com/shutting-down-packagist-org-support-for-composer-1-x/';
             $this->rootFile['warning-versions'] = '<1.99';
-            $this->rootFile['info'] = json_decode('"\u001b[37;44m#StandWith\u001b[30;43mUkraine\u001b[0m"');
 
             if ($verbose) {
                 echo 'Dumping individual listings'.PHP_EOL;
@@ -431,7 +430,7 @@ class SymlinkDumper
                             'ids' => $ids,
                             'dumped' => $dt,
                         ],
-                        ['ids' => Connection::PARAM_INT_ARRAY]
+                        ['ids' => ArrayParameterType::INTEGER]
                     );
                     break;
                 } catch (\Exception $e) {

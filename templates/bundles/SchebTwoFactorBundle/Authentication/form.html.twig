@@ -34,10 +34,12 @@
                 {% endif %}
             </form>
 
+            <p>Lost access to your authenticator? Enter the backup code in the form above to disable 2FA.</p>
+
             <hr>
 
             {# The logout link gives the user a way out if they can't complete two-factor authentication #}
-            <a href="{{ logoutPath }}">{{ "cancel"|trans({}, 'SchebTwoFactorBundle') }}</a>
+            <a href="{{ logout_path() }}">{{ "cancel"|trans({}, 'SchebTwoFactorBundle') }}</a>
         </div>
         <div class="clearfix"></div>
     </section>

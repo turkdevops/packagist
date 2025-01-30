@@ -13,6 +13,7 @@
 namespace App\Entity;
 
 use DateTimeImmutable;
+use Doctrine\Common\Collections\ArrayCollection;
 use Doctrine\ORM\QueryBuilder;
 use Doctrine\ORM\Query;
 use Doctrine\DBAL\Cache\QueryCacheProfile;
@@ -56,7 +57,7 @@ class PackageRepository extends ServiceEntityRepository
         $query = $this->getEntityManager()
             ->createQuery("
                 SELECT p.name FROM App\Entity\Package p
-                WHERE p.dumpedAt >= :date AND (p.replacementPackage IS NULL OR p.replacementPackage != 'spam/spam')
+                WHERE p.dumpedAt >= :date AND p.frozen IS NULL
             ")
             ->setParameters(['date' => $date]);
 
@@ -71,7 +72,7 @@ class PackageRepository extends ServiceEntityRepository
     public function getPackageNames(): array
     {
         $query = $this->getEntityManager()
-            ->createQuery("SELECT p.name FROM App\Entity\Package p WHERE p.replacementPackage IS NULL OR p.replacementPackage != 'spam/spam'");
+            ->createQuery("SELECT p.name FROM App\Entity\Package p WHERE p.frozen IS NULL");
 
         $names = $this->getPackageNamesForQuery($query);
 
@@ -98,25 +99,21 @@ class PackageRepository extends ServiceEntityRepository
     /**
      * @return array<string>
      */
-    public function getPackageNamesByType(string $type): array
+    public function getPackageNamesByTypeAndVendor(?string $type, ?string $vendor): array
     {
-        $query = $this->getEntityManager()
-            ->createQuery("SELECT p.name FROM App\Entity\Package p WHERE p.type = :type AND (p.replacementPackage IS NULL OR p.replacementPackage != 'spam/spam')")
-            ->setParameters(['type' => $type]);
+        $qb = $this->getEntityManager()->getRepository(Package::class)->createQueryBuilder('p')
+            ->select('p.name')
+            ->where('p.frozen IS NULL');
+        if ($type !== null) {
+            $qb->andWhere('p.type = :type')
+                ->setParameter('type', $type);
+        }
+        if ($vendor !== null) {
+            $qb->andWhere('p.vendor = :vendor')
+                ->setParameter('vendor', $vendor);
+        }
 
-        return $this->getPackageNamesForQuery($query);
-    }
-
-    /**
-     * @return array<string>
-     */
-    public function getPackageNamesByVendor(string $vendor): array
-    {
-        $query = $this->getEntityManager()
-            ->createQuery("SELECT p.name FROM App\Entity\Package p WHERE p.vendor = :vendor AND (p.replacementPackage IS NULL OR p.replacementPackage != 'spam/spam')")
-            ->setParameters(['vendor' => $vendor]);
-
-        return $this->getPackageNamesForQuery($query);
+        return $this->getPackageNamesForQuery($qb->getQuery());
     }
 
     /**
@@ -165,11 +162,10 @@ class PackageRepository extends ServiceEntityRepository
             $selector .= ', p.replacementPackage';
         }
 
-        $where = '(p.replacementPackage IS NULL OR p.replacementPackage != :replacement)';
+        $where = 'p.frozen IS NULL';
         foreach ($filters as $filter => $val) {
             $where .= ' AND p.'.$filter.' = :'.$filter;
         }
-        $filters['replacement'] = "spam/spam";
         $query = $this->getEntityManager()
             ->createQuery("SELECT p.name $selector FROM App\Entity\Package p WHERE $where ORDER BY p.name")
             ->setParameters($filters);
@@ -190,6 +186,7 @@ class PackageRepository extends ServiceEntityRepository
     }
 
     /**
+     * @param Query<mixed, array{name: string}> $query
      * @return list<string>
      */
     private function getPackageNamesForQuery(Query $query): array
@@ -217,6 +214,7 @@ class PackageRepository extends ServiceEntityRepository
         return $conn->fetchAllAssociative(
             'SELECT p.id FROM package p
             WHERE p.abandoned = false
+            AND p.frozen IS NULL
             AND (
                 p.crawledAt IS NULL
                 OR (p.autoUpdated = 0 AND p.crawledAt < :recent AND p.createdAt >= :yesterday)
@@ -258,6 +256,7 @@ class PackageRepository extends ServiceEntityRepository
             FROM package p
             LEFT JOIN download d ON (d.id = p.id AND d.type = 1)
             WHERE (p.dumpedAt IS NULL OR (p.dumpedAt <= p.crawledAt AND p.crawledAt < NOW()))
+            AND p.frozen IS NULL
             AND (d.total > 1000 OR d.lastUpdated > :date)
             ORDER BY p.crawledAt ASC
         ', ['date' => date('Y-m-d H:i:s', strtotime('-4months'))]);
@@ -271,7 +270,7 @@ class PackageRepository extends ServiceEntityRepository
             SELECT p.id
             FROM package p
             LEFT JOIN download d ON (d.id = p.id AND d.type = 1)
-            WHERE p.id = :id
+            WHERE p.id = :id AND p.frozen IS NULL
             AND (d.total > 1000 OR d.lastUpdated > :date)
         ', ['id' => $package->getId(), 'date' => date('Y-m-d H:i:s', strtotime('-4months'))]);
     }
@@ -283,7 +282,7 @@ class PackageRepository extends ServiceEntityRepository
     {
         $conn = $this->getEntityManager()->getConnection();
 
-        return $conn->fetchFirstColumn('SELECT p.id FROM package p WHERE p.dumpedAtV2 IS NULL OR (p.dumpedAtV2 <= p.crawledAt AND p.crawledAt < NOW())');
+        return $conn->fetchFirstColumn('SELECT p.id FROM package p USE INDEX (dumped2_crawled_frozen_idx) WHERE (p.dumpedAtV2 IS NULL OR (p.dumpedAtV2 <= p.crawledAt AND p.crawledAt < NOW())) AND p.frozen IS NULL');
     }
 
     /**
@@ -307,33 +306,43 @@ class PackageRepository extends ServiceEntityRepository
 
     public function getPartialPackageByNameWithVersions(string $name): Package
     {
-        // first fetch a partial package including joined versions/maintainers, that way
-        // the join is cheap and heavy data (description, readme) is not duplicated for each joined row
-        //
-        // fetching everything partial here to avoid fetching tons of data,
+        // first fetch the package alone to avoid joins with heavy data (description, readme) that would be duplicated for each joined row
+        $qb = $this->getEntityManager()->createQueryBuilder();
+        $qb->select('p')
+            ->from('App\Entity\Package', 'p')
+            ->where('p.name = ?0')
+            ->setParameters([$name]);
+        $pkg = $qb->getQuery()->getSingleResult();
+
+        // then fetch partial version data here to avoid fetching tons of data,
         // this helps for packages like https://packagist.org/packages/ccxt/ccxt
         // with huge amounts of versions
         $qb = $this->getEntityManager()->createQueryBuilder();
-        $qb->select('partial p.{id}', 'partial v.{id, version, normalizedVersion, development, releasedAt, extra, isDefaultBranch}')
-            ->from('App\Entity\Package', 'p')
-            ->leftJoin('p.versions', 'v')
+        $qb->select('v.id, v.version, v.normalizedVersion, v.development, v.releasedAt, v.extra, v.isDefaultBranch')
+            ->from('App\Entity\Version', 'v')
             ->orderBy('v.development', 'DESC')
             ->addOrderBy('v.releasedAt', 'DESC')
-            ->where('p.name = ?0')
-            ->setParameters([$name]);
+            ->where('v.package = ?0')
+            ->setParameters([$pkg]);
 
-        $pkg = $qb->getQuery()->getSingleResult();
-
-        if ($pkg instanceof Package) {
-            // then refresh the package to complete its data and inject the previously
-            // fetched partial versions to get a complete package
-            $versions = $pkg->getVersions();
-            $this->getEntityManager()->refresh($pkg);
-
-            $prop = new \ReflectionProperty($pkg, 'versions');
-            $prop->setAccessible(true);
-            $prop->setValue($pkg, $versions);
+        $versions = [];
+        $reflId = new \ReflectionProperty(Version::class, 'id');
+        foreach ($qb->getQuery()->getArrayResult() as $row) {
+            $versions[] = $v = new Version;
+            $reflId->setValue($v, $row['id']);
+            $v->setName($pkg->getName());
+            $v->setPackage($pkg);
+            $v->setVersion($row['version']);
+            $v->setNormalizedVersion($row['normalizedVersion']);
+            $v->setDevelopment($row['development']);
+            $v->setReleasedAt($row['releasedAt']);
+            $v->setExtra($row['extra']);
+            $v->setIsDefaultBranch($row['isDefaultBranch']);
         }
+        $versions = new ArrayCollection($versions);
+
+        $prop = new \ReflectionProperty($pkg, 'versions');
+        $prop->setValue($pkg, $versions);
 
         return $pkg;
     }
@@ -403,7 +412,7 @@ class PackageRepository extends ServiceEntityRepository
             $qb->leftJoin('v.tags', 't');
         }
 
-        $qb->andWhere('(p.replacementPackage IS NULL OR p.replacementPackage != \'spam/spam\')');
+        $qb->andWhere('p.frozen IS NULL');
 
         $qb->orderBy('p.abandoned');
         if (true === $orderByName) {
@@ -455,7 +464,7 @@ class PackageRepository extends ServiceEntityRepository
      */
     public function getSuspectPackageCount(): int
     {
-        $sql = 'SELECT COUNT(*) count FROM package p WHERE p.suspect IS NOT NULL AND (p.replacementPackage IS NULL OR p.replacementPackage != "spam/spam")';
+        $sql = 'SELECT COUNT(*) count FROM package p WHERE p.suspect IS NOT NULL AND p.frozen IS NULL';
 
         return max(0, (int) $this->getEntityManager()->getConnection()->fetchOne($sql));
     }
@@ -466,7 +475,7 @@ class PackageRepository extends ServiceEntityRepository
     public function getSuspectPackages(int $offset = 0, int $limit = 15): array
     {
         $sql = 'SELECT p.id, p.name, p.description, p.language, p.abandoned, p.replacementPackage
-            FROM package p WHERE p.suspect IS NOT NULL AND (p.replacementPackage IS NULL OR p.replacementPackage != "spam/spam") ORDER BY p.createdAt DESC LIMIT '.((int) $limit).' OFFSET '.((int) $offset);
+            FROM package p WHERE p.suspect IS NOT NULL AND p.frozen IS NULL ORDER BY p.createdAt DESC LIMIT '.((int) $limit).' OFFSET '.((int) $offset);
 
         return $this->getEntityManager()->getConnection()->fetchAllAssociative($sql);
     }
@@ -491,7 +500,8 @@ class PackageRepository extends ServiceEntityRepository
     /**
      * @param string   $name Package name to find the dependents of
      * @param int|null $type One of Dependent::TYPE_*
-     * @return array<array{id: int, name: string, description: string|null, language: string|null, abandoned: int, replacementPackage: string|null}>
+     * @param 'downloads'|'name' $orderBy
+     * @return list<array{id: int, name: string, description: string|null, language: string|null, abandoned: int, replacementPackage: string|null}>
      */
     public function getDependents(string $name, int $offset = 0, int $limit = 15, string $orderBy = 'name', ?int $type = null): array
     {
@@ -517,6 +527,7 @@ class PackageRepository extends ServiceEntityRepository
             ) x ON x.package_id = p.id '.$join.' ORDER BY '.$orderByField.' LIMIT '.((int) $limit).' OFFSET '.((int) $offset);
 
         $res = [];
+        /** @var array{id: int, name: string, description: string|null, language: string|null, abandoned: bool, replacementPackage: string|null} $row */
         foreach ($this->getEntityManager()->getConnection()->fetchAllAssociative($sql, $args) as $row) {
             $res[] = ['id' => (int) $row['id'], 'abandoned' => (int) $row['abandoned']] + $row;
         }
@@ -563,7 +574,7 @@ class PackageRepository extends ServiceEntityRepository
                 $sql,
                 [],
                 [],
-                new QueryCacheProfile(86400, 'total_packages', $this->getEntityManager()->getConfiguration()->getResultCacheImpl())
+                new QueryCacheProfile(86400, 'total_packages', $this->getEntityManager()->getConfiguration()->getResultCache())
             );
         $result = $stmt->fetchAllAssociative();
         $stmt->free();
@@ -583,7 +594,7 @@ class PackageRepository extends ServiceEntityRepository
                 $sql,
                 [],
                 [],
-                new QueryCacheProfile(3600, 'package_count_by_year_month', $this->getEntityManager()->getConfiguration()->getResultCacheImpl())
+                new QueryCacheProfile(3600, 'package_count_by_year_month', $this->getEntityManager()->getConfiguration()->getResultCache())
             );
         $result = $stmt->fetchAllAssociative();
         $stmt->free();
