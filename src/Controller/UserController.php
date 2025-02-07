@@ -13,6 +13,7 @@
 namespace App\Controller;
 
 use App\Attribute\VarName;
+use App\Entity\TemporaryTwoFactorUser;
 use App\Model\FavoriteManager;
 use App\Entity\Package;
 use App\Entity\Version;
@@ -24,6 +25,8 @@ use App\Model\ProviderManager;
 use App\Model\RedisAdapter;
 use App\Security\TwoFactorAuthManager;
 use App\Service\Scheduler;
+use Endroid\QrCode\ErrorCorrectionLevel;
+use Endroid\QrCode\RoundBlockSizeMode;
 use Endroid\QrCode\Writer\SvgWriter;
 use Pagerfanta\Pagerfanta;
 use Psr\Log\LoggerInterface;
@@ -34,7 +37,7 @@ use Symfony\Component\Form\FormError;
 use Symfony\Component\HttpFoundation\RedirectResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
-use Symfony\Component\Routing\Annotation\Route;
+use Symfony\Component\Routing\Attribute\Route;
 use Symfony\Component\Security\Core\Authentication\Token\Storage\TokenStorageInterface;
 use Predis\Client as RedisClient;
 use Symfony\Component\Security\Csrf\CsrfTokenManagerInterface;
@@ -103,7 +106,7 @@ class UserController extends Controller
 
             $em->getConnection()->executeStatement(
                 'UPDATE package p JOIN maintainers_packages mp ON mp.package_id = p.id
-                 SET abandoned = 1, replacementPackage = "spam/spam", suspect = "spam", indexedAt = NULL, dumpedAt = "2100-01-01 00:00:00"
+                 SET frozen = "spam", indexedAt = NULL
                  WHERE mp.user_id = :userId',
                 ['userId' => $user->getId()]
             );
@@ -263,58 +266,49 @@ class UserController extends Controller
             throw $this->createAccessDeniedException('You cannot change this user\'s two-factor authentication settings');
         }
 
-        $enableRequest = new EnableTwoFactorRequest();
-        $form = $this->createForm(EnableTwoFactorAuthType::class, $enableRequest)
-            ->handleRequest($req);
-
-        $secret = (string) $req->getSession()->get('2fa_secret');
-        if (!$form->isSubmitted() || '' === $secret) {
-            $secret = $authenticator->generateSecret();
-            $req->getSession()->set('2fa_secret', $secret);
-        }
-
+        $secret = (string) $req->getSession()->get('2fa_secret') ?: $authenticator->generateSecret();
         // Temporarily store this code on the user, as we'll need it there to generate the
         // QR code and to check the confirmation code.  We won't actually save this change
         // until we've confirmed the code
-        $user->setTotpSecret($secret);
+        $temporary2faUser = new TemporaryTwoFactorUser($user, $secret);
 
-        if ($form->isSubmitted()) {
-            // Validate the code using the secret that was submitted in the form
-            if (!$authenticator->checkCode($user, $enableRequest->getCode() ?? '')) {
-                $form->get('code')->addError(new FormError('Invalid authenticator code'));
-            }
+        $enableRequest = new EnableTwoFactorRequest();
+        $form = $this->createForm(EnableTwoFactorAuthType::class, $enableRequest, ['user' => $temporary2faUser])
+            ->handleRequest($req);
 
-            if ($form->isValid()) {
-                $req->getSession()->remove('2fa_secret');
-                $authManager->enableTwoFactorAuth($user, $secret);
-                $backupCode = $authManager->generateAndSaveNewBackupCode($user);
+        if ($form->isSubmitted() && $form->isValid()) {
+            $user->setTotpSecret($secret);
+            $req->getSession()->remove('2fa_secret');
+            $authManager->enableTwoFactorAuth($user, $secret);
+            $backupCode = $authManager->generateAndSaveNewBackupCode($user);
 
-                $this->addFlash('success', 'Two-factor authentication has been enabled.');
-                $req->getSession()->set('backup_code', $backupCode);
+            $this->addFlash('success', 'Two-factor authentication has been enabled.');
+            $req->getSession()->set('backup_code', $backupCode);
 
-                return $this->redirectToRoute('user_2fa_confirm', ['name' => $user->getUsername()]);
-            }
+            return $this->redirectToRoute('user_2fa_confirm', ['name' => $user->getUsername()]);
         }
 
-        $qrContent = $authenticator->getQRContent($user);
+        $req->getSession()->set('2fa_secret', $secret);
+        $qrContent = $authenticator->getQRContent($temporary2faUser);
 
-        $qrCode = Builder::create()
-            ->writer(new SvgWriter())
-            ->writerOptions([])
-            ->data($qrContent)
-            ->encoding(new Encoding('UTF-8'))
-            ->errorCorrectionLevel(new ErrorCorrectionLevelHigh())
-            ->size(200)
-            ->margin(0)
-            ->roundBlockSizeMode(new RoundBlockSizeModeMargin())
-            ->build();
+        $qrCode = new Builder(
+            writer: new SvgWriter(),
+            writerOptions: [],
+            data: $qrContent,
+            encoding: new Encoding('UTF-8'),
+            errorCorrectionLevel: ErrorCorrectionLevel::High,
+            size: 200,
+            margin: 0,
+            roundBlockSizeMode: RoundBlockSizeMode::Margin,
+        );
 
         return $this->render(
             'user/enable_two_factor_auth.html.twig',
             [
                 'user' => $user,
                 'form' => $form,
-                'qrCode' => $qrCode->getDataUri(),
+                'tfaConfig' => $temporary2faUser->getTotpAuthenticationConfiguration(),
+                'qrCode' => $qrCode->build()->getDataUri(),
             ]
         );
     }

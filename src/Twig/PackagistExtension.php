@@ -27,13 +27,11 @@ class PackagistExtension extends AbstractExtension
 {
     private ProviderManager $providerManager;
     private RecaptchaHelper $recaptchaHelper;
-    private RequestStack $requestStack;
 
-    public function __construct(ProviderManager $providerManager, RecaptchaHelper $recaptchaHelper, RequestStack $requestStack)
+    public function __construct(ProviderManager $providerManager, RecaptchaHelper $recaptchaHelper)
     {
         $this->providerManager = $providerManager;
         $this->recaptchaHelper = $recaptchaHelper;
-        $this->requestStack = $requestStack;
     }
 
     public function getTests(): array
@@ -114,7 +112,7 @@ class PackagistExtension extends AbstractExtension
 
     public function generateGravatarHash(string $email): string
     {
-        return md5(strtolower($email));
+        return hash('md5', strtolower($email));
     }
 
     /**
@@ -124,8 +122,8 @@ class PackagistExtension extends AbstractExtension
     public function sortLinks(array $links): array
     {
         usort($links, static function (PackageLink $a, PackageLink $b) {
-            $aPlatform = Preg::isMatch(PlatformRepository::PLATFORM_PACKAGE_REGEX, $a->getPackageName());
-            $bPlatform = Preg::isMatch(PlatformRepository::PLATFORM_PACKAGE_REGEX, $b->getPackageName());
+            $aPlatform = PlatformRepository::isPlatformPackage($a->getPackageName());
+            $bPlatform = PlatformRepository::isPlatformPackage($b->getPackageName());
 
             if ($aPlatform !== $bPlatform) {
                 return $aPlatform ? -1 : 1;
@@ -144,14 +142,10 @@ class PackagistExtension extends AbstractExtension
         return $links;
     }
 
-    public function requiresRecaptcha(?string $username): bool
+    public function requiresRecaptcha(): bool
     {
-        $clientIp = $this->requestStack->getCurrentRequest()?->getClientIp();
+        $context = $this->recaptchaHelper->buildContext();
 
-        if (null === $clientIp || null === $username) {
-            return false;
-        }
-
-        return $this->recaptchaHelper->requiresRecaptcha($clientIp, $username);
+        return $this->recaptchaHelper->requiresRecaptcha($context);
     }
 }

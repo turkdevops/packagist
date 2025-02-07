@@ -16,6 +16,7 @@ use App\Entity\User;
 use App\Form\ResetPasswordFormType;
 use App\Form\ResetPasswordRequestFormType;
 use App\Security\BruteForceLoginFormAuthenticator;
+use App\Security\Passport\Badge\ResolvedTwoFactorCodeCredentials;
 use App\Security\UserChecker;
 use Beelab\Recaptcha2Bundle\Recaptcha\RecaptchaException;
 use Beelab\Recaptcha2Bundle\Recaptcha\RecaptchaVerifier;
@@ -26,7 +27,7 @@ use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\Mailer\MailerInterface;
 use Symfony\Component\Mime\Address;
 use Symfony\Component\PasswordHasher\Hasher\UserPasswordHasherInterface;
-use Symfony\Component\Routing\Annotation\Route;
+use Symfony\Component\Routing\Attribute\Route;
 use Symfony\Component\Security\Core\Exception\AuthenticationException;
 use Symfony\Component\Security\Http\Authentication\UserAuthenticatorInterface;
 
@@ -52,14 +53,6 @@ class ResetPasswordController extends Controller
         $form->handleRequest($request);
 
         if ($form->isSubmitted() && $form->isValid()) {
-            try {
-                $recaptchaVerifier->verify();
-            } catch (RecaptchaException $e) {
-                $this->addFlash('error', 'Invalid ReCaptcha. Please try again.');
-
-                return $this->redirectToRoute('request_pwd_reset');
-            }
-
             return $this->processSendingPasswordResetEmail(
                 $form->get('email')->getData(),
                 $mailer
@@ -82,6 +75,8 @@ class ResetPasswordController extends Controller
 
     /**
      * Validates and process the reset URL that the user clicked in their email.
+     *
+     * @param BruteForceLoginFormAuthenticator<User> $authenticator
      */
     #[Route(path: '/reset-password/reset/{token}', name: 'do_pwd_reset')]
     public function reset(Request $request, UserPasswordHasherInterface $passwordHasher, UserChecker $userChecker, UserAuthenticatorInterface $userAuthenticator, BruteForceLoginFormAuthenticator $authenticator, ?string $token = null): Response
@@ -98,12 +93,11 @@ class ResetPasswordController extends Controller
         }
 
         // The token is valid; allow the user to change their password.
-        $form = $this->createForm(ResetPasswordFormType::class);
+        $form = $this->createForm(ResetPasswordFormType::class, $user);
         $form->handleRequest($request);
 
         if ($form->isSubmitted() && $form->isValid()) {
-            $user->setPasswordRequestedAt(null);
-            $user->clearConfirmationToken();
+            $user->resetPasswordRequest();
             if (!$user->hasRole('ROLE_SPAMMER')) {
                 $user->setEnabled(true);
             }
@@ -124,7 +118,9 @@ class ResetPasswordController extends Controller
                 // skip authenticating if any pre-auth check does not pass
             }
 
-            if ($response = $userAuthenticator->authenticateUser($user, $authenticator, $request)) {
+            // A user resetting the password with 2FA enabled, should automatically be marked as 2FA complete
+            $badges = $user->isTotpAuthenticationEnabled() ? [new ResolvedTwoFactorCodeCredentials()] : [];
+            if ($response = $userAuthenticator->authenticateUser($user, $authenticator, $request, $badges)) {
                 return $response;
             }
 

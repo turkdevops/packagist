@@ -18,14 +18,12 @@ use App\Security\EmailVerifier;
 use App\Security\BruteForceLoginFormAuthenticator;
 use App\Entity\UserRepository;
 use App\Security\UserChecker;
-use Beelab\Recaptcha2Bundle\Recaptcha\RecaptchaException;
-use Beelab\Recaptcha2Bundle\Recaptcha\RecaptchaVerifier;
 use Symfony\Bridge\Twig\Mime\TemplatedEmail;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\Mime\Address;
 use Symfony\Component\PasswordHasher\Hasher\UserPasswordHasherInterface;
-use Symfony\Component\Routing\Annotation\Route;
+use Symfony\Component\Routing\Attribute\Route;
 use Symfony\Component\Security\Core\Exception\AuthenticationException;
 use Symfony\Component\Security\Http\Authentication\UserAuthenticatorInterface;
 use SymfonyCasts\Bundle\VerifyEmail\Exception\VerifyEmailExceptionInterface;
@@ -37,7 +35,7 @@ class RegistrationController extends Controller
     }
 
     #[Route(path: '/register/', name: 'register')]
-    public function register(Request $request, UserPasswordHasherInterface $passwordHasher, string $mailFromEmail, string $mailFromName, RecaptchaVerifier $recaptchaVerifier): Response
+    public function register(Request $request, UserPasswordHasherInterface $passwordHasher, string $mailFromEmail, string $mailFromName): Response
     {
         if ($this->getUser()) {
             return $this->redirectToRoute('home');
@@ -48,14 +46,6 @@ class RegistrationController extends Controller
         $form->handleRequest($request);
 
         if ($form->isSubmitted() && $form->isValid()) {
-            try {
-                $recaptchaVerifier->verify();
-            } catch (RecaptchaException $e) {
-                $this->addFlash('error', 'Invalid ReCaptcha. Please try again.');
-
-                return $this->redirectToRoute('register');
-            }
-
             // encode the plain password
             $user->setPassword(
                 $passwordHasher->hashPassword(
@@ -63,8 +53,6 @@ class RegistrationController extends Controller
                     $form->get('plainPassword')->getData()
                 )
             );
-
-            $user->initializeApiToken();
 
             $this->getEM()->persist($user);
             $this->getEM()->flush();
@@ -90,6 +78,9 @@ class RegistrationController extends Controller
         ]);
     }
 
+    /**
+     * @param BruteForceLoginFormAuthenticator<User> $authenticator
+     */
     #[Route(path: '/register/verify', name: 'register_confirm_email')]
     public function confirmEmail(Request $request, UserRepository $userRepository, UserChecker $userChecker, UserAuthenticatorInterface $userAuthenticator, BruteForceLoginFormAuthenticator $authenticator): Response
     {

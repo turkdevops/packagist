@@ -12,6 +12,7 @@
 
 namespace App\Entity;
 
+use App\Validator\NotReservedWord;
 use Doctrine\Common\Collections\ArrayCollection;
 use Doctrine\Common\Collections\Collection;
 use Doctrine\Common\Collections\Selectable;
@@ -43,6 +44,7 @@ class User implements UserInterface, TwoFactorInterface, BackupCodeInterface, Eq
     #[Assert\Length(min: 2, max: 191, groups: ['Profile', 'Registration'])]
     #[Assert\Regex(pattern: '{^[^/"\r\n><#\[\]]{2,100}$}')]
     #[Assert\NotBlank(groups: ['Profile', 'Registration'])]
+    #[NotReservedWord(groups: ['Profile', 'Registration'])]
     private string $username;
 
     #[ORM\Column(type: 'string', name: 'username_canonical', length: 191, unique: true)]
@@ -61,9 +63,9 @@ class User implements UserInterface, TwoFactorInterface, BackupCodeInterface, Eq
     private bool $enabled = false;
 
     /**
-     * @var list<string>
+     * @var array<string>
      */
-    #[ORM\Column(type: 'array')]
+    #[ORM\Column(type: 'json')]
     private array $roles = [];
 
     /**
@@ -99,8 +101,11 @@ class User implements UserInterface, TwoFactorInterface, BackupCodeInterface, Eq
     #[ORM\Column(type: 'datetime')]
     private DateTimeInterface $createdAt;
 
-    #[ORM\Column(type: 'string', length: 20)]
+    #[ORM\Column(type: 'string', length: 40)]
     private string $apiToken;
+
+    #[ORM\Column(type: 'string', length: 40)]
+    private string $safeApiToken;
 
     #[ORM\Column(type: 'string', length: 255, nullable: true)]
     private string|null $githubId = null;
@@ -120,10 +125,15 @@ class User implements UserInterface, TwoFactorInterface, BackupCodeInterface, Eq
     #[ORM\Column(type: 'string', length: 8, nullable: true)]
     private string|null $backupCode = null;
 
+    #[ORM\Column(type: 'smallint', options: ['unsigned' => true, 'default' => 0])]
+    private int $sessionBuster = 0;
+
     public function __construct()
     {
         $this->packages = new ArrayCollection();
         $this->createdAt = new \DateTimeImmutable();
+        $this->initializeApiToken();
+        $this->initializeSafeApiToken();
     }
 
     public function __toString(): string
@@ -168,6 +178,16 @@ class User implements UserInterface, TwoFactorInterface, BackupCodeInterface, Eq
     public function getApiToken(): string
     {
         return $this->apiToken;
+    }
+
+    public function setSafeApiToken(string $apiToken): void
+    {
+        $this->safeApiToken = $apiToken;
+    }
+
+    public function getSafeApiToken(): string
+    {
+        return $this->safeApiToken;
     }
 
     public function getGithubId(): string|null
@@ -236,12 +256,13 @@ class User implements UserInterface, TwoFactorInterface, BackupCodeInterface, Eq
 
     public function getGravatarUrl(): string
     {
-        return 'https://www.gravatar.com/avatar/'.md5(strtolower($this->getEmail())).'?d=identicon';
+        return 'https://www.gravatar.com/avatar/'.hash('md5', strtolower($this->getEmail())).'?d=identicon';
     }
 
     public function setTotpSecret(string|null $secret): void
     {
         $this->totpSecret = $secret;
+        $this->invalidateAllSessions();
     }
 
     public function isTotpAuthenticationEnabled(): bool
@@ -307,6 +328,7 @@ class User implements UserInterface, TwoFactorInterface, BackupCodeInterface, Eq
             $this->id,
             $this->email,
             $this->emailCanonical,
+            'session_buster' => $this->sessionBuster,
         ];
     }
 
@@ -325,6 +347,9 @@ class User implements UserInterface, TwoFactorInterface, BackupCodeInterface, Eq
             $this->email,
             $this->emailCanonical
         ] = $data;
+
+        // session_buster might not be available yet in the session
+        $this->sessionBuster = $data['session_buster'] ?? 0;
     }
 
     public function eraseCredentials(): void
@@ -454,6 +479,12 @@ class User implements UserInterface, TwoFactorInterface, BackupCodeInterface, Eq
         $this->passwordRequestedAt = $date;
     }
 
+    public function resetPasswordRequest(): void
+    {
+        $this->setPasswordRequestedAt(null);
+        $this->clearConfirmationToken();
+    }
+
     /**
      * Gets the timestamp that the user requested a password reset.
      */
@@ -496,12 +527,21 @@ class User implements UserInterface, TwoFactorInterface, BackupCodeInterface, Eq
             return false;
         }
 
+        if ($this->getSessionBuster() !== $user->getSessionBuster()) {
+            return false;
+        }
+
         return (!$this->getPassword() && !$user->getPassword()) || ($this->getPassword() && $user->getPassword() && hash_equals($this->getPassword(), $user->getPassword()));
     }
 
     public function initializeApiToken(): void
     {
-        $this->apiToken = substr(hash('sha256', random_bytes(20)), 0, 20);
+        $this->apiToken = bin2hex(random_bytes(20));
+    }
+
+    public function initializeSafeApiToken(): void
+    {
+        $this->safeApiToken = bin2hex(random_bytes(20));
     }
 
     public function getConfirmationToken(): string|null
@@ -511,7 +551,7 @@ class User implements UserInterface, TwoFactorInterface, BackupCodeInterface, Eq
 
     public function initializeConfirmationToken(): void
     {
-        $this->confirmationToken = substr(hash('sha256', random_bytes(40)), 0, 40);
+        $this->confirmationToken = bin2hex(random_bytes(20));
     }
 
     public function clearConfirmationToken(): void
@@ -522,5 +562,15 @@ class User implements UserInterface, TwoFactorInterface, BackupCodeInterface, Eq
     public function isPasswordRequestExpired(int $ttl): bool
     {
         return !$this->getPasswordRequestedAt() instanceof \DateTime || $this->getPasswordRequestedAt()->getTimestamp() + $ttl <= time();
+    }
+
+    public function getSessionBuster(): int
+    {
+        return $this->sessionBuster;
+    }
+
+    public function invalidateAllSessions(): void
+    {
+        $this->sessionBuster = ($this->sessionBuster + 1) % 65535;
     }
 }

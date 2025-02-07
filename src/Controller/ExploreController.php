@@ -22,7 +22,7 @@ use Pagerfanta\Pagerfanta;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
-use Symfony\Component\Routing\Annotation\Route;
+use Symfony\Component\Routing\Attribute\Route;
 use Symfony\Component\Routing\Generator\UrlGeneratorInterface;
 use Predis\Client as RedisClient;
 use Symfony\Component\HttpKernel\EventListener\AbstractSessionListener;
@@ -38,7 +38,7 @@ class ExploreController extends Controller
         $newSubmitted = $pkgRepo->getQueryBuilderForNewestPackages()->setMaxResults(10)
             ->getQuery()->enableResultCache(60)->getResult();
         $newReleases = $verRepo->getLatestReleases(10);
-        $maxId = (int) $this->getEM()->getConnection()->fetchOne('SELECT max(id) FROM package');
+        $maxId = max(1, (int) $this->getEM()->getConnection()->fetchOne('SELECT max(id) FROM package'));
         $random = $pkgRepo
             ->createQueryBuilder('p')->where('p.id >= :randId')->andWhere('p.abandoned = 0')
             ->setParameter('randId', random_int(1, $maxId))->setMaxResults(10)
@@ -111,7 +111,6 @@ class ExploreController extends Controller
                 'total' => $packages->getNbResults(),
             ];
 
-            /** @var Package $package */
             foreach ($packages as $package) {
                 $url = $this->generateUrl('view_package', ['name' => $package->getName()], UrlGeneratorInterface::ABSOLUTE_URL);
 

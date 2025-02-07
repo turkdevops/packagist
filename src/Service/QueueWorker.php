@@ -12,6 +12,7 @@
 
 namespace App\Service;
 
+use App\Logger\LogIdProcessor;
 use Monolog\LogRecord;
 use Predis\Client as Redis;
 use Monolog\Logger;
@@ -34,7 +35,8 @@ class QueueWorker
         private Logger $logger,
         /** @var array<string, UpdaterWorker|GitHubUserMigrationWorker|SecurityAdvisoryWorker> */
         private array $jobWorkers,
-        private StatsDClient $statsd
+        private StatsDClient $statsd,
+        private readonly LogIdProcessor $logIdProcessor,
     ) {
     }
 
@@ -112,11 +114,7 @@ class QueueWorker
             throw new \LogicException('At this point a job should always be found');
         }
 
-        $this->logger->pushProcessor(static function (LogRecord $record) use ($job) {
-            $record->extra['job-id'] = $job->getId();
-
-            return $record;
-        });
+        $this->logIdProcessor->startJob($job->getId());
 
         $expectedStart = $job->getExecuteAfter() ?: $job->getCreatedAt();
         $start = microtime(true);
@@ -139,6 +137,7 @@ class QueueWorker
                     'status' => 'type_errored',
                 ]);
             }
+            /** @phpstan-var ErroredResult $result */
             $result = [
                 'status' => Job::STATUS_ERRORED,
                 'message' => 'An unexpected failure occurred',
@@ -161,17 +160,22 @@ class QueueWorker
             $this->doctrine->resetManager();
         }
 
-        // refetch objects in case the EM was reset during the job run
+        // reset EM for safety to avoid flushing anything not flushed during the job, and refetch objects
         $em = $this->getEM();
+        $em->clear();
         $repo = $em->getRepository(Job::class);
+        $job = $repo->find($jobId);
+        if (null === $job) {
+            throw new \LogicException('At this point a job should always be found');
+        }
 
         if ($result['status'] === Job::STATUS_RESCHEDULE) {
             Assert::keyExists($result, 'after', message: '$result must have an "after" key when returning a reschedule status.');
             $job->reschedule($result['after']);
-            $em->flush($job);
+            $em->persist($job);
+            $em->flush();
 
             $this->logger->reset();
-            $this->logger->popProcessor();
 
             return true;
         }
@@ -183,17 +187,15 @@ class QueueWorker
         if (isset($result['exception'])) {
             $result['exceptionMsg'] = $result['exception']->getMessage();
             $result['exceptionClass'] = get_class($result['exception']);
+            unset($result['exception']);
         }
 
-        $job = $repo->find($jobId);
-        if (null === $job) {
-            throw new \LogicException('At this point a job should always be found');
-        }
         $job->complete($result);
+        $em->persist($job);
 
         $this->redis->setex('job-'.$job->getId(), 600, json_encode($result));
 
-        $em->flush($job);
+        $em->flush();
         $em->clear();
 
         if ($result['status'] === Job::STATUS_FAILED) {
@@ -203,7 +205,6 @@ class QueueWorker
         }
 
         $this->logger->reset();
-        $this->logger->popProcessor();
 
         return true;
     }

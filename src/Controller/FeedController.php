@@ -17,7 +17,7 @@ use App\Entity\Package;
 use App\Entity\Version;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
-use Symfony\Component\Routing\Annotation\Route;
+use Symfony\Component\Routing\Attribute\Route;
 use Symfony\Component\Routing\Generator\UrlGeneratorInterface;
 use Laminas\Feed\Writer\Entry;
 use Laminas\Feed\Writer\Feed;
@@ -168,14 +168,12 @@ class FeedController extends Controller
 
     /**
      * Receives either a Package or a Version and populates a feed entry.
-     *
-     * @param Package|Version $item
      */
-    protected function populateEntry(Entry $entry, $item): void
+    protected function populateEntry(Entry $entry, Package|Version $item): void
     {
         if ($item instanceof Package) {
             $this->populatePackageData($entry, $item);
-        } elseif ($item instanceof Version) {
+        } else {
             $this->populatePackageData($entry, $item->getPackage());
             $this->populateVersionData($entry, $item);
         }

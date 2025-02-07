@@ -8,8 +8,12 @@ use App\Model\DownloadManager;
 use Predis\Connection\ConnectionException;
 use Symfony\Bundle\SecurityBundle\Security;
 use Symfony\Component\Security\Core\Authentication\Token\TokenInterface;
+use Symfony\Component\Security\Core\Authorization\Voter\Voter;
 
-class PackageVoter extends \Symfony\Component\Security\Core\Authorization\Voter\Voter
+/**
+ * @extends Voter<value-of<PackageActions>, Package>
+ */
+class PackageVoter extends Voter
 {
     public function __construct(
         private Security $security,
@@ -35,8 +39,7 @@ class PackageVoter extends \Symfony\Component\Security\Core\Authorization\Voter\
         $package = $subject;
 
         return match(PackageActions::from($attribute)) {
-            PackageActions::Abandon => !$package->isAbandoned() && ($package->isMaintainer($user) || $this->security->isGranted('ROLE_EDIT_PACKAGES')),
-            PackageActions::Unabandon => $package->isAbandoned() && ($package->isMaintainer($user) || $this->security->isGranted('ROLE_EDIT_PACKAGES')),
+            PackageActions::Abandon => $this->canEdit($package, $user),
             PackageActions::Delete => $this->canDelete($package, $user),
             PackageActions::DeleteVersion => $this->canDeleteVersion($package, $user),
             PackageActions::Edit => $this->canEdit($package, $user),

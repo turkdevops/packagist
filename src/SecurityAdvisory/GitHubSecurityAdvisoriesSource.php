@@ -28,6 +28,12 @@ class GitHubSecurityAdvisoriesSource implements SecurityAdvisorySourceInterface
 {
     public const SOURCE_NAME = 'GitHub';
 
+    private const IGNORE_CVES = [
+        'CVE-2024-36611', // @see https://phpc.social/@wouterj/113588554019692959
+        'CVE-2024-36610', // @see https://phpc.social/@wouterj/113588554019692959
+        'CVE-2024-57610', // store.sylius.com issue incorrectly filed as general sylius vulnerability https://github.com/nca785/CVE-2024-57610
+    ];
+
     /**
      * @param list<string> $fallbackGhTokens
      */
@@ -44,6 +50,8 @@ class GitHubSecurityAdvisoriesSource implements SecurityAdvisorySourceInterface
     {
         /** @var array<string, array<string, RemoteSecurityAdvisory>> $advisoryMap */
         $advisoryMap = [];
+        /** @var array<string, array<string, true>> $foundPackageCves */
+        $foundPackageCves = [];
         $hasNextPage = true;
         $after = '';
 
@@ -93,6 +101,10 @@ class GitHubSecurityAdvisoriesSource implements SecurityAdvisorySourceInterface
                     continue;
                 }
 
+                if (in_array($cve, self::IGNORE_CVES, true)) {
+                    continue;
+                }
+
                 $packageName = strtolower($node['package']['name']);
 
                 // GitHub adds spaces everywhere e.g. > 1.0, adjust to be able to match other advisories
@@ -100,6 +112,15 @@ class GitHubSecurityAdvisoriesSource implements SecurityAdvisorySourceInterface
                 if (isset($advisoryMap[$packageName][$remoteId])) {
                     $advisoryMap[$packageName][$remoteId] = $advisoryMap[$packageName][$remoteId]->withAddedAffectedVersion($versionRange);
                     continue;
+                }
+
+                // GitHub can have multiple advisories per CVE and package
+                if ($cve !== null) {
+                    if (isset($foundPackageCves[$packageName][$cve])) {
+                        continue;
+                    }
+
+                    $foundPackageCves[$packageName][$cve] = true;
                 }
 
                 $references = [];
@@ -125,6 +146,7 @@ class GitHubSecurityAdvisoriesSource implements SecurityAdvisorySourceInterface
                     $this->providerManager->packageExists($packageName) ? SecurityAdvisory::PACKAGIST_ORG : null,
                     $references,
                     self::SOURCE_NAME,
+                    Severity::fromGitHub($node['advisory']['severity']),
                 );
             }
 
@@ -157,6 +179,7 @@ query {
         permalink,
         publishedAt,
         withdrawnAt,
+        severity,
         identifiers {
           type,
           value

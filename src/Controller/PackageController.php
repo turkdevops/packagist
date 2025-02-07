@@ -13,11 +13,15 @@
 namespace App\Controller;
 
 use App\Entity\Dependent;
+use App\Entity\PackageFreezeReason;
+use App\Entity\PackageRepository;
 use App\Entity\PhpStat;
 use App\Security\Voter\PackageActions;
+use App\SecurityAdvisory\GitHubSecurityAdvisoriesSource;
 use App\Util\Killswitch;
 use App\Model\DownloadManager;
 use App\Model\FavoriteManager;
+use Composer\MetadataMinifier\MetadataMinifier;
 use Composer\Package\Version\VersionParser;
 use Composer\Pcre\Preg;
 use Composer\Semver\Constraint\Constraint;
@@ -51,9 +55,10 @@ use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\RedirectResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\HttpKernel\Attribute\MapQueryParameter;
 use Symfony\Component\HttpKernel\Exception\BadRequestHttpException;
 use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
-use Symfony\Component\Routing\Annotation\Route;
+use Symfony\Component\Routing\Attribute\Route;
 use Symfony\Component\Routing\Generator\UrlGeneratorInterface;
 use Symfony\Component\Security\Core\Exception\AccessDeniedException;
 use App\Service\GitHubUserMigrationWorker;
@@ -68,7 +73,11 @@ use Symfony\Component\Mailer\MailerInterface;
 use Symfony\Component\Security\Http\Attribute\CurrentUser;
 use Symfony\Component\Security\Http\Attribute\IsGranted;
 use UnexpectedValueException;
+use Webmozart\Assert\Assert;
 
+/**
+ * @phpstan-import-type VersionArray from Version
+ */
 class PackageController extends Controller
 {
     public function __construct(
@@ -77,6 +86,9 @@ class PackageController extends Controller
         private Scheduler $scheduler,
         private FavoriteManager $favoriteManager,
         private DownloadManager $downloadManager,
+        private string $buildDir,
+        /** @var AwsMetadata */
+        private array $awsMetadata,
     ) {
     }
 
@@ -87,19 +99,21 @@ class PackageController extends Controller
     }
 
     #[Route(path: '/packages/list.json', name: 'list', defaults: ['_format' => 'json'], methods: ['GET'])]
-    public function listAction(Request $req): JsonResponse
+    public function listAction(Request $req,
+        PackageRepository $repo,
+        #[MapQueryParameter] ?string $type=null,
+        #[MapQueryParameter] ?string $vendor=null,
+    ): JsonResponse
     {
-        $repo = $this->getEM()->getRepository(Package::class);
         $queryParams = $req->query->all();
         $fields = (array) ($queryParams['fields'] ?? []); // support single or multiple fields
-        /** @var string[] $fields */
         $fields = array_intersect($fields, ['repository', 'type', 'abandoned']);
 
         if (count($fields) > 0) {
             $filters = array_filter([
-                'type' => $req->query->get('type'),
-                'vendor' => $req->query->get('vendor'),
-            ]);
+                'type' => $type,
+                'vendor' => $vendor,
+            ], fn ($val) => $val !== null);
 
             $response = new JsonResponse(['packages' => $repo->getPackagesWithFields($filters, $fields)]);
             $response->setSharedMaxAge(300);
@@ -108,10 +122,8 @@ class PackageController extends Controller
             return $response;
         }
 
-        if ($req->query->get('type')) {
-            $names = $repo->getPackageNamesByType($req->query->get('type'));
-        } elseif ($req->query->get('vendor')) {
-            $names = $repo->getPackageNamesByVendor($req->query->get('vendor'));
+        if ($type !== null || $vendor !== null) {
+            $names = $repo->getPackageNamesByTypeAndVendor($type, $vendor);
         } else {
             $names = $this->providerManager->getPackageNames();
         }
@@ -451,6 +463,26 @@ class PackageController extends Controller
         return $this->redirectToRoute('view_spam');
     }
 
+    #[IsGranted('ROLE_ADMIN')]
+    #[Route(path: '/package/{name}/unfreeze', name: 'unfreeze_package', requirements: ['name' => '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?'], defaults: ['_format' => 'html'], methods: ['POST'])]
+    public function unfreezePackageAction(Request $req, string $name, CsrfTokenManagerInterface $csrfTokenManager): Response
+    {
+        if (!$this->isCsrfTokenValid('unfreeze', (string) $req->request->get('token'))) {
+            throw new BadRequestHttpException('Invalid CSRF token');
+        }
+
+        $package = $this->getPackageByName($req, $name);
+        if ($package instanceof Response) {
+            return $package;
+        }
+
+        $package->unfreeze();
+        $this->getEM()->persist($package);
+        $this->getEM()->flush();
+
+        return $this->redirectToRoute('view_package', ['name' => $package->getName()]);
+    }
+
     #[Route(path: '/packages/{name}.{_format}', name: 'view_package', requirements: ['name' => '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?', '_format' => '(json)'], defaults: ['_format' => 'html'], methods: ['GET'])]
     public function viewPackageAction(Request $req, string $name, CsrfTokenManagerInterface $csrfTokenManager, #[CurrentUser] ?User $user = null): Response
     {
@@ -470,19 +502,61 @@ class PackageController extends Controller
             return $this->{$match['method'].'Action'}($req, $match['pkg']);
         }
 
-        $package = $this->getPartialPackageWithVersions($req, $name);
+        if ('json' === $req->getRequestFormat()) {
+            $package = $this->getPackageByName($req, $name);
+        } else {
+            $package = $this->getPartialPackageWithVersions($req, $name);
+        }
         if ($package instanceof Response) {
             return $package;
         }
 
-        if ($package->isAbandoned() && $package->getReplacementPackage() === 'spam/spam' && !$this->isGranted('ROLE_ADMIN')) {
+        if ($package->isFrozen() && $package->getFreezeReason() === PackageFreezeReason::Spam && !$this->isGranted('ROLE_ANTISPAM')) {
             throw new NotFoundHttpException('This is a spam package');
         }
 
         $repo = $this->getEM()->getRepository(Package::class);
 
         if ('json' === $req->getRequestFormat()) {
-            $data = $package->toArray($this->getEM()->getRepository(Version::class), true);
+            $staticFiles = [
+                $this->buildDir.'/p2/'.$package->getName().'~dev.json',
+                $this->buildDir.'/p2/'.$package->getName().'.json',
+            ];
+            $versions = [];
+            $foundFiles = false;
+            $gzdecode = isset($this->awsMetadata['primary']) && $this->awsMetadata['primary'] === false;
+            foreach ($staticFiles as $file) {
+                if ($gzdecode) {
+                    $file .= '.gz';
+                }
+                if (file_exists($file)) {
+                    $contents = file_get_contents($file);
+                    if ($contents !== false) {
+                        if ($gzdecode) {
+                            $contents = gzdecode($contents);
+                            if ($contents === false) {
+                                throw new \RuntimeException('Failed to gzdecode '.$file);
+                            }
+                        }
+                        $contents = json_decode($contents, true);
+                        if (isset($contents['packages'][$package->getName()])) {
+                            $versionsData = $contents['packages'][$package->getName()];
+                            if (isset($contents['minified']) && $contents['minified'] === 'composer/2.0') {
+                                $versionsData = MetadataMinifier::expand($versionsData);
+                            }
+                            /** @var VersionArray $version */
+                            foreach ($versionsData as $version) {
+                                $versions[$version['version']] = $version;
+                            }
+                            $foundFiles = true;
+                        }
+                    }
+                }
+            }
+            unset($versionsData, $contents, $staticFiles, $file);
+
+            $data = $package->toArray($foundFiles ? $versions : $this->getEM()->getRepository(Version::class), true);
+
             if (Killswitch::isEnabled(Killswitch::LINKS_ENABLED)) {
                 $data['dependents'] = $repo->getDependentCount($package->getName());
                 $data['suggesters'] = $repo->getSuggestCount($package->getName());
@@ -514,6 +588,7 @@ class PackageController extends Controller
 
         $version = null;
         $expandedVersion = null;
+        /** @var Version[] $versions */
         $versions = $package->getVersions()->toArray();
 
         usort($versions, Package::class.'::sortVersions');
@@ -523,7 +598,14 @@ class PackageController extends Controller
 
             // load the default branch version as it is used to display the latest available source.* and homepage info
             $version = reset($versions);
-            $this->getEM()->refresh($version);
+            foreach ($versions as $v) {
+                if ($v->isDefaultBranch()) {
+                    $version = $v;
+                    break;
+                }
+            }
+            $version = $versionRepo->find($version->getId());
+            Assert::notNull($version);
 
             $expandedVersion = $version;
             foreach ($versions as $candidate) {
@@ -535,9 +617,12 @@ class PackageController extends Controller
 
             // load the expanded version fully to be able to display all info including tags
             if ($expandedVersion->getId() !== $version->getId()) {
-                $this->getEM()->refresh($expandedVersion);
+                $expandedVersion = $versionRepo->find($expandedVersion->getId());
+                Assert::notNull($expandedVersion);
+            } else {
+                // ensure we get the reloaded $version with full data if it was overwritten above by $candidate
+                $expandedVersion = $version;
             }
-            $expandedVersion = $versionRepo->getFullVersion($expandedVersion->getId());
         }
 
         $data = [
@@ -632,6 +717,9 @@ class PackageController extends Controller
         if ($this->isGranted('ROLE_ANTISPAM')) {
             $data['markSafeCsrfToken'] = $csrfTokenManager->getToken('mark_safe');
         }
+        if ($this->isGranted('ROLE_ADMIN')) {
+            $data['unfreezeCsrfToken'] = $csrfTokenManager->getToken('unfreeze');
+        }
 
         return $this->render('package/view_package.html.twig', $data);
     }
@@ -698,7 +786,7 @@ class PackageController extends Controller
     }
 
     #[Route(path: '/versions/{versionId}/delete', name: 'delete_version', requirements: ['name' => '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?', 'versionId' => '[0-9]+'], methods: ['DELETE'])]
-    public function deletePackageVersionAction(Request $req, int $versionId, #[CurrentUser] ?User $user = null): Response
+    public function deletePackageVersionAction(Request $req, int $versionId): Response
     {
         $repo = $this->getEM()->getRepository(Version::class);
 
@@ -723,7 +811,7 @@ class PackageController extends Controller
     }
 
     #[Route(path: '/packages/{name}', name: 'update_package', requirements: ['name' => '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+'], defaults: ['_format' => 'json'], methods: ['PUT'])]
-    public function updatePackageAction(Request $req, string $name): Response
+    public function updatePackageAction(Request $req, string $name, #[CurrentUser] User $user): Response
     {
         try {
             $package = $this->getEM()
@@ -733,26 +821,17 @@ class PackageController extends Controller
             return new JsonResponse(['status' => 'error', 'message' => 'Package not found'], 404);
         }
 
-        if ($package->isAbandoned() && $package->getReplacementPackage() === 'spam/spam') {
+        if ($package->isFrozen() && $package->getFreezeReason() === PackageFreezeReason::Spam) {
             throw new NotFoundHttpException('This is a spam package');
         }
-
-        $username = $req->request->has('username') ?
-            $req->request->get('username') :
-            $req->query->get('username');
-
-        $apiToken = $req->request->has('apiToken') ?
-            $req->request->get('apiToken') :
-            $req->query->get('apiToken');
 
         $update = $req->request->getBoolean('update', $req->query->getBoolean('update'));
         $autoUpdated = $req->request->get('autoUpdated', $req->query->get('autoUpdated'));
         $updateEqualRefs = $req->request->getBoolean('updateAll', $req->query->getBoolean('updateAll'));
         $manualUpdate = $req->request->getBoolean('manualUpdate', $req->query->getBoolean('manualUpdate'));
 
-        $user = $this->getUser() ?: $this->getEM()->getRepository(User::class)
-            ->findOneBy(['usernameCanonical' => $username, 'apiToken' => $apiToken]);
-
+        // check that a user is logged in to trigger an update on a package they don't own at least to avoid abuse
+        $user = $this->getUser();
         if (!$user instanceof User) {
             return new JsonResponse(['status' => 'error', 'message' => 'Invalid credentials'], 403);
         }
@@ -772,7 +851,7 @@ class PackageController extends Controller
             }
 
             if ($update) {
-                $job = $this->scheduler->scheduleUpdate($package, $updateEqualRefs, false, null, $manualUpdate);
+                $job = $this->scheduler->scheduleUpdate($package, 'button/api', $updateEqualRefs, false, null, $manualUpdate);
 
                 return new JsonResponse(['status' => 'success', 'job' => $job->getId()], 202);
             }
@@ -808,7 +887,7 @@ class PackageController extends Controller
         return new Response('Invalid form input', 400);
     }
 
-    #[Route(path: '/packages/{name}/maintainers/', name: 'add_maintainer', requirements: ['name' => '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+'])]
+    #[Route(path: '/packages/{name:package}/maintainers/', name: 'add_maintainer', requirements: ['name' => '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+'])]
     public function createMaintainerAction(Request $req, #[MapEntity] Package $package, LoggerInterface $logger): RedirectResponse
     {
         $this->denyAccessUnlessGranted(PackageActions::AddMaintainer->value, $package);
@@ -845,7 +924,7 @@ class PackageController extends Controller
         return $this->redirectToRoute('view_package', ['name' => $package->getName()]);
     }
 
-    #[Route(path: '/packages/{name}/maintainers/delete', name: 'remove_maintainer', requirements: ['name' => '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+'])]
+    #[Route(path: '/packages/{name:package}/maintainers/delete', name: 'remove_maintainer', requirements: ['name' => '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+'])]
     public function removeMaintainerAction(Request $req, #[MapEntity] Package $package, LoggerInterface $logger): Response
     {
         $this->denyAccessUnlessGranted(PackageActions::RemoveMaintainer->value, $package);
@@ -888,7 +967,7 @@ class PackageController extends Controller
         ]);
     }
 
-    #[Route(path: '/packages/{name}/edit', name: 'edit_package', requirements: ['name' => '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?'])]
+    #[Route(path: '/packages/{name:package}/edit', name: 'edit_package', requirements: ['name' => '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?'])]
     public function editAction(Request $req, #[MapEntity] Package $package, #[CurrentUser] ?User $user = null): Response
     {
         $this->denyAccessUnlessGranted(PackageActions::Edit->value, $package);
@@ -903,6 +982,8 @@ class PackageController extends Controller
         if ($form->isSubmitted() && $form->isValid()) {
             // Force updating of packages once the package is viewed after the redirect.
             $package->setCrawledAt(null);
+            // Reset remoteId as if the URL changes we expect possibly a different id and that's ok
+            $package->setRemoteId(null);
 
             $em = $this->getEM();
             $em->persist($package);
@@ -919,7 +1000,7 @@ class PackageController extends Controller
         ]);
     }
 
-    #[Route(path: '/packages/{name}/abandon', name: 'abandon_package', requirements: ['name' => '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?'])]
+    #[Route(path: '/packages/{name:package}/abandon', name: 'abandon_package', requirements: ['name' => '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?'])]
     public function abandonAction(Request $request, #[MapEntity] Package $package, #[CurrentUser] ?User $user = null): Response
     {
         $this->denyAccessUnlessGranted(PackageActions::Abandon->value, $package);
@@ -930,8 +1011,8 @@ class PackageController extends Controller
             $package->setAbandoned(true);
             $package->setReplacementPackage(str_replace('https://packagist.org/packages/', '', (string) $form->get('replacement')->getData()));
             $package->setIndexedAt(null);
-            $package->setCrawledAt(new DateTime());
-            $package->setUpdatedAt(new DateTime());
+            $package->setCrawledAt(new DateTimeImmutable());
+            $package->setUpdatedAt(new DateTimeImmutable());
             $package->setDumpedAt(null);
             $package->setDumpedAtV2(null);
 
@@ -947,16 +1028,16 @@ class PackageController extends Controller
         ]);
     }
 
-    #[Route(path: '/packages/{name}/unabandon', name: 'unabandon_package', requirements: ['name' => '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?'])]
+    #[Route(path: '/packages/{name:package}/unabandon', name: 'unabandon_package', requirements: ['name' => '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?'], methods: ['POST'])]
     public function unabandonAction(#[MapEntity] Package $package, #[CurrentUser] ?User $user = null): RedirectResponse
     {
-        $this->denyAccessUnlessGranted(PackageActions::Unabandon->value, $package);
+        $this->denyAccessUnlessGranted(PackageActions::Abandon->value, $package);
 
         $package->setAbandoned(false);
         $package->setReplacementPackage(null);
         $package->setIndexedAt(null);
-        $package->setCrawledAt(new DateTime());
-        $package->setUpdatedAt(new DateTime());
+        $package->setCrawledAt(new DateTimeImmutable());
+        $package->setUpdatedAt(new DateTimeImmutable());
         $package->setDumpedAt(null);
         $package->setDumpedAtV2(null);
 
@@ -1022,7 +1103,7 @@ class PackageController extends Controller
         return $this->render('package/stats.html.twig', $data);
     }
 
-    #[Route(path: '/packages/{name}/php-stats.{_format}', name: 'view_package_php_stats', requirements: ['name' => '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?', '_format' => '(json)'], defaults: ['_format' => 'html'])]
+    #[Route(path: '/packages/{name:package}/php-stats.{_format}', name: 'view_package_php_stats', requirements: ['name' => '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?', '_format' => '(json)'], defaults: ['_format' => 'html'])]
     public function phpStatsAction(Request $req, #[MapEntity] Package $package): Response
     {
         if (!Killswitch::isEnabled(Killswitch::DOWNLOADS_ENABLED)) {
@@ -1205,22 +1286,35 @@ class PackageController extends Controller
         if (!Killswitch::isEnabled(Killswitch::LINKS_ENABLED)) {
             return new Response('This page is temporarily disabled, please come back later.', Response::HTTP_BAD_GATEWAY);
         }
-        $page = max(1, $req->query->getInt('page', 1));
-        $perPage = 15;
-        $orderBy = $req->query->get('order_by', 'name');
-        $requires = $req->query->get('requires', 'all');
 
+        if ($resp = $this->blockAbusers($req)) {
+            return $resp;
+        }
+
+        $page = max(1, $req->query->getInt('page', 1));
+        if ($req->getRequestFormat() === 'html' && $page > 3 && $this->getUser() === null) {
+            return new Response('<html>You must <a href="'.$this->generateUrl('login').'">log in</a> to access this page.', Response::HTTP_FORBIDDEN);
+        }
+
+        $perPage = 15;
         if ($req->getRequestFormat() === 'json') {
             $perPage = 100;
         }
 
-        $repo = $this->getEM()->getRepository(Package::class);
-        $requireType = null;
-        if ($requires === 'require') {
-            $requireType = Dependent::TYPE_REQUIRE;
-        } elseif ($requires === 'require-dev') {
-            $requireType = Dependent::TYPE_REQUIRE_DEV;
+        $orderBy = $req->query->get('order_by', 'name');
+        if (!in_array($orderBy, ['name', 'downloads'], true)) {
+            throw new BadRequestHttpException('Invalid order_by parameter provided');
         }
+
+        $requires = $req->query->get('requires', 'all');
+        $requireType = match ($requires) {
+            'require' => Dependent::TYPE_REQUIRE,
+            'require-dev' => Dependent::TYPE_REQUIRE_DEV,
+            'all' => null,
+            default => throw new BadRequestHttpException('Invalid requires parameter provided'),
+        };
+
+        $repo = $this->getEM()->getRepository(Package::class);
         $depCount = $repo->getDependentCount($name, $requireType);
         $packages = $repo->getDependents($name, ($page - 1) * $perPage, $perPage, $orderBy, $requireType);
 
@@ -1233,6 +1327,7 @@ class PackageController extends Controller
             $data = [
                 'packages' => $paginator->getCurrentPageResults(),
             ];
+            Assert::isArray($data['packages']);
             $meta = $this->getPackagesMetadata($this->favoriteManager, $this->downloadManager, $data['packages']);
             foreach ($data['packages'] as $index => $package) {
                 $data['packages'][$index]['downloads'] = $meta['downloads'][$package['id']];
@@ -1265,9 +1360,17 @@ class PackageController extends Controller
         if (!Killswitch::isEnabled(Killswitch::LINKS_ENABLED)) {
             return new Response('This page is temporarily disabled, please come back later.', Response::HTTP_BAD_GATEWAY);
         }
-        $page = max(1, $req->query->getInt('page', 1));
-        $perPage = 15;
 
+        if ($resp = $this->blockAbusers($req)) {
+            return $resp;
+        }
+
+        $page = max(1, $req->query->getInt('page', 1));
+        if ($req->getRequestFormat() === 'html' && $page > 3 && $this->getUser() === null) {
+            return new Response('<html>You must <a href="'.$this->generateUrl('login').'">log in</a> to access this page.', Response::HTTP_FORBIDDEN);
+        }
+
+        $perPage = 15;
         if ($req->getRequestFormat() === 'json') {
             $perPage = 100;
         }
@@ -1285,6 +1388,7 @@ class PackageController extends Controller
             $data = [
                 'packages' => $paginator->getCurrentPageResults(),
             ];
+            Assert::isArray($data['packages']);
             $meta = $this->getPackagesMetadata($this->favoriteManager, $this->downloadManager, $data['packages']);
             foreach ($data['packages'] as $index => $package) {
                 $data['packages'][$index]['downloads'] = $meta['downloads'][$package['id']];
@@ -1307,19 +1411,19 @@ class PackageController extends Controller
         return $this->render('package/suggesters.html.twig', $data);
     }
 
-    #[Route(path: '/packages/{name}/stats/all.json', name: 'package_stats', requirements: ['name' => '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?'])]
+    #[Route(path: '/packages/{name:package}/stats/all.json', name: 'package_stats', requirements: ['name' => '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?'])]
     public function overallStatsAction(Request $req, #[MapEntity] Package $package): JsonResponse
     {
         return $this->computeStats($req, $package);
     }
 
-    #[Route(path: '/packages/{name}/stats/major/{majorVersion}.json', name: 'major_version_stats', requirements: ['name' => '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?', 'majorVersion' => '(all|[0-9]+?)'])]
+    #[Route(path: '/packages/{name:package}/stats/major/{majorVersion}.json', name: 'major_version_stats', requirements: ['name' => '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?', 'majorVersion' => '(all|[0-9]+?)'])]
     public function majorVersionStatsAction(Request $req, #[MapEntity] Package $package, string $majorVersion): JsonResponse
     {
         return $this->computeStats($req, $package, null, $majorVersion);
     }
 
-    #[Route(path: '/packages/{name}/stats/{version}.json', name: 'version_stats', requirements: ['name' => '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?', 'version' => '.+?'])]
+    #[Route(path: '/packages/{name:package}/stats/{version}.json', name: 'version_stats', requirements: ['name' => '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?', 'version' => '.+?'])]
     public function versionStatsAction(Request $req, #[MapEntity] Package $package, string $version): JsonResponse
     {
         $normalizer = new VersionParser;
@@ -1412,7 +1516,7 @@ class PackageController extends Controller
     {
         /** @var SecurityAdvisoryRepository $repo */
         $repo = $this->getEM()->getRepository(SecurityAdvisory::class);
-        $securityAdvisories = $repo->getPackageSecurityAdvisories($name);
+        $securityAdvisories = $repo->findByPackageName($name);
 
         $data = [];
         $data['name'] = $name;
@@ -1427,7 +1531,7 @@ class PackageController extends Controller
                 $versionParser = new VersionParser();
                 foreach ($securityAdvisories as $advisory) {
                     try {
-                        $affectedVersionConstraint = $versionParser->parseConstraints($advisory['affectedVersions']);
+                        $affectedVersionConstraint = $versionParser->parseConstraints($advisory->getAffectedVersions());
                     } catch (UnexpectedValueException) {
                         // ignore parsing errors, advisory must be invalid
                         continue;
@@ -1448,6 +1552,28 @@ class PackageController extends Controller
         return $this->render('package/security_advisories.html.twig', $data);
     }
 
+    #[Route(path: '/security-advisories/{id}', name: 'view_advisory')]
+    public function securityAdvisoryAction(Request $request, string $id): Response
+    {
+        $repo = $this->getEM()->getRepository(SecurityAdvisory::class);
+        if (str_starts_with($id, 'CVE-')) {
+            $securityAdvisories = $repo->findBy(['cve' => $id]);
+        } elseif (str_starts_with($id, 'GHSA-')) {
+            $securityAdvisories = $repo->findByRemoteId(GitHubSecurityAdvisoriesSource::SOURCE_NAME, $id);
+        } else {
+            $securityAdvisories = array_filter([$repo->findOneBy(['packagistAdvisoryId' => $id])]);
+        }
+
+        if (0 === count($securityAdvisories)) {
+            throw new NotFoundHttpException();
+        }
+
+        return $this->render('package/security_advisory.html.twig', ['securityAdvisories' => $securityAdvisories, 'id' => $id]);
+    }
+
+    /**
+     * @return FormInterface<MaintainerRequest>
+     */
     private function createAddMaintainerForm(Package $package): FormInterface
     {
         $maintainerRequest = new MaintainerRequest();
@@ -1455,6 +1581,9 @@ class PackageController extends Controller
         return $this->createForm(AddMaintainerRequestType::class, $maintainerRequest);
     }
 
+    /**
+     * @return FormInterface<MaintainerRequest>
+     */
     private function createRemoveMaintainerForm(Package $package): FormInterface
     {
         $maintainerRequest = new MaintainerRequest();
@@ -1464,6 +1593,9 @@ class PackageController extends Controller
         ]);
     }
 
+    /**
+     * @return FormInterface<array{}>
+     */
     private function createDeletePackageForm(Package $package): FormInterface
     {
         return $this->createFormBuilder([])->getForm();
@@ -1474,7 +1606,26 @@ class PackageController extends Controller
         $repo = $this->getEM()->getRepository(Package::class);
 
         try {
-            return $repo->getPartialPackageByNameWithVersions($name);
+            return $repo->getPackageByName($name);
+        } catch (NoResultException) {
+            if ('json' === $req->getRequestFormat()) {
+                return new JsonResponse(['status' => 'error', 'message' => 'Package not found'], 404);
+            }
+
+            if ($repo->findProviders($name)) {
+                return $this->redirect($this->generateUrl('view_providers', ['name' => $name]));
+            }
+
+            return $this->redirect($this->generateUrl('search_web', ['q' => $name, 'reason' => 'package_not_found']));
+        }
+    }
+
+    private function getPackageByName(Request $req, string $name): Package|Response
+    {
+        $repo = $this->getEM()->getRepository(Package::class);
+
+        try {
+            return $repo->getPackageByName($name);
         } catch (NoResultException) {
             if ('json' === $req->getRequestFormat()) {
                 return new JsonResponse(['status' => 'error', 'message' => 'Package not found'], 404);
@@ -1585,17 +1736,26 @@ class PackageController extends Controller
 
     private function blockAbusers(Request $req): ?JsonResponse
     {
+        if (str_contains((string) $req->headers->get('User-Agent'), 'Bytespider; spider-feedback@bytedance.com')) {
+            return new JsonResponse("Please respect noindex/nofollow meta tags, and email contact@packagist.org to get unblocked once this is resolved", 429, ['Retry-After' => 31536000]);
+        }
+
         $abusers = [
             '193.13.144.72',
-            '144.178.97.2',
             '185.167.99.27',
             '82.77.112.123',
             '14.116.239.33', '14.116.239.34', '14.116.239.35', '14.116.239.36', '14.116.239.37',
             '14.22.11.161', '14.22.11.162', '14.22.11.163', '14.22.11.164', '14.22.11.165',
             '216.251.130.74',
+            '212.107.30.81', '35.89.149.248',
+            '82.180.155.159',
+            '212.107.30.81',
+            '107.158.141.2',
+            '2a02:4780:d:5838::1',
+            '82.180.155.159',
         ];
-        if ('json' === $req->getRequestFormat() && in_array($req->getClientIp(), $abusers, true)) {
-            return new JsonResponse("Please use a proper user-agent with contact information or get in touch before abusing the API", 429);
+        if (in_array($req->getClientIp(), $abusers, true)) {
+            return new JsonResponse("Please use a proper user-agent with contact information or get in touch before abusing the API", 429, ['Retry-After' => 31536000]);
         }
 
         return null;

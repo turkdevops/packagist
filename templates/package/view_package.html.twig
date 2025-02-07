@@ -29,7 +29,7 @@
 
 {% block content %}
     <div class="row" id="view-package-page">
-        <div class="col-xs-12 package"{% if app.user and package.crawledAt is null and is_granted('edit', package) %} data-force-crawl="true"{% endif %}>
+        <div class="col-xs-12 package"{% if app.user and package.crawledAt is null and is_granted('edit', package) and not package.isFrozen() %} data-force-crawl="true"{% endif %}>
             <div class="package-header">
 
                 <div class="row">
@@ -46,7 +46,7 @@
 
             <div class="row">
                 <div class="col-md-8">
-                    <p class="requireme"><i class="glyphicon glyphicon-save"></i> <input type="text" readonly="readonly" value="composer {% if package.type == 'project' %}create-project{% else %}require{% endif %} {{ "#{package.vendor}/#{package.packageName}" }}" /></p>
+                    <p class="requireme"><i class="glyphicon glyphicon-save"></i> <input type="text" readonly="readonly" value="{{ package.installCommand(version) }}" /></p>
 
                     {% if not package.isAutoUpdated() and is_granted('update', package) %}
                         {% if "github.com" in package.repository %}
@@ -67,7 +67,7 @@
                                 {% endif %}
                             {% else %}
                                 No replacement package was suggested.
-                                {% if is_granted('unabandon', package) %}
+                                {% if is_granted('abandon', package) %}
                                     <a href="{{ path('abandon_package', {name: package.name}) }}">Suggest a replacement.</a>
                                 {% endif %}
                             {% endif %}
@@ -86,14 +86,15 @@
                     {% if hasActions %}
                         <div class="btn-group btn-group-xs">
                             {% if is_granted('abandon', package) %}
-                                <form class="action abandon" action="{{ path('abandon_package', {name: package.name}) }}">
-                                    <input class="btn btn-warning" type="submit" value="Abandon" />
-                                </form>
-                            {% endif %}
-                            {% if is_granted('unabandon', package) %}
-                                <form class="action un-abandon" action="{{ path('unabandon_package', {name: package.name}) }}">
-                                    <input class="btn btn-default" type="submit" value="Un-abandon" />
-                                </form>
+                                {% if package.abandoned %}
+                                    <form class="action un-abandon" action="{{ path('unabandon_package', {name: package.name}) }}" method="POST">
+                                        <input class="btn btn-default" type="submit" value="Un-abandon" />
+                                    </form>
+                                {% else %}
+                                    <form class="action abandon" action="{{ path('abandon_package', {name: package.name}) }}">
+                                        <input class="btn btn-warning" type="submit" value="Abandon" />
+                                    </form>
+                                {% endif %}
                             {% endif %}
                             {% if is_granted('delete', package) %}
                                 <form class="delete action" action="{{ path('delete_package', {name: package.name}) }}" method="DELETE">
@@ -119,10 +120,19 @@
                                     <input class="btn btn-danger" type="submit" value="Mark Not Spam" />
                                 </form>
                             {% endif %}
+                            {% if is_granted('ROLE_ADMIN') and package.isFrozen() %}
+                                <form class="action" action="{{ path("unfreeze_package", {name: package.name}) }}" method="POST">
+                                    <input type="hidden" name="token" value="{{ unfreezeCsrfToken }}" />
+                                    <input class="btn btn-danger" type="submit" value="Unfreeze" />
+                                </form>
+                            {% endif %}
                         </div>
                         {% if lastJobWarning is defined and lastJobWarning is not empty %}
                             <p class="alert alert-danger">{{ lastJobWarning|raw }} <br /> <a href="#" data-msg="{{ lastJobMsg }}" data-details="{{ lastJobDetails }}" class="view-log">View Last Update Log</a></p>
                         {% endif %}
+                    {% endif %}
+                    {% if package.isFrozen() %}
+                        <p class="alert alert-danger">{{ package.getFreezeReason().translationKey()|trans }}</p>
                     {% endif %}
                 </div>
 
@@ -223,10 +233,10 @@
                                     {{ securityAdvisories|number_format(0, '.', '&#8201;')|raw }}
                                 </p>
                             {% endif %}
-                            {% if 'github.com' in repoUrl and package.gitHubStars is not null %}
+                            {% if package.gitHubStars is not null %}
                                 <p>
                                     <span>
-                                        <a href="{{ repoUrl }}/stargazers">Stars</a>:
+                                        <a href="{{ package.gitHubStarsUrl }}">Stars</a>:
                                     </span>
                                     {{ package.gitHubStars|number_format(0, '.', '&#8201;')|raw }}
                                 </p>
@@ -238,10 +248,10 @@
                                     </span> {{ package.gitHubWatches|number_format(0, '.', '&#8201;')|raw }}
                                 </p>
                             {% endif %}
-                            {% if 'github.com' in repoUrl and package.gitHubForks is not null %}
+                            {% if package.gitHubForks is not null %}
                                 <p>
                                     <span>
-                                        <a href="{{ repoUrl }}/forks">Forks</a>:
+                                        <a href="{{ package.gitHubForksUrl }}">Forks</a>:
                                     </span>
                                     {{ package.gitHubForks|number_format(0, '.', '&#8201;')|raw }}
                                 </p>
@@ -265,9 +275,9 @@
                 </div>
             </div>
 
-            {% if addMaintainerForm is defined or removeMaintainerForm is defined %}
+            {% if is_granted('remove_maintainer', package) or is_granted('add_maintainer', package) %}
                 <div class="row">
-                    {% if addMaintainerForm is defined %}
+                    {% if is_granted('add_maintainer', package) %}
                         {{ form_start(addMaintainerForm, {
                             attr: { id: 'add-maintainer-form', class: 'col-sm-6 col-md-3 col-md-offset-9 ' ~ (show_add_maintainer_form|default(false) ? '': 'hidden') },
                             action: path('add_maintainer', { 'name': package.name })
@@ -285,7 +295,7 @@
                         {{ form_end(addMaintainerForm) }}
                     {% endif %}
 
-                    {% if removeMaintainerForm is defined %}
+                    {% if is_granted('remove_maintainer', package) %}
                         {{ form_start(removeMaintainerForm, {
                             attr: { id: 'remove-maintainer-form', class: 'col-sm-6 col-md-3 col-md-offset-9 ' ~ (show_remove_maintainer_form|default(false) ? '': 'hidden') },
                             action: path('remove_maintainer', { 'name': package.name })

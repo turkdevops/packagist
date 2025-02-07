@@ -25,7 +25,7 @@ use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\RedirectResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
-use Symfony\Component\Routing\Annotation\Route;
+use Symfony\Component\Routing\Attribute\Route;
 use Predis\Client as RedisClient;
 use Symfony\Component\HttpKernel\EventListener\AbstractSessionListener;
 use Symfony\Contracts\Cache\CacheInterface;
@@ -67,9 +67,9 @@ class WebController extends Controller
 
         try {
             $query = new Query(
-                $req->query->has('q') ? $req->query->get('q') : $req->query->get('query', ''),
-                (array) ($req->query->all()['tags'] ?? []),
-                $req->query->get('type', ''),
+                $req->query->has('q') ? $req->query->getString('q') : $req->query->getString('query'),
+                array_values((array) ($req->query->all()['tags'] ?? [])),
+                $req->query->getString('type', ''),
                 $req->query->getInt('per_page', 15),
                 $req->query->getInt('page', 1)
             );
@@ -177,9 +177,9 @@ class WebController extends Controller
             'versions' => !empty($chart['versions']) ? max($chart['versions']) : 0,
             'downloads' => $downloads,
             'downloadsChart' => $dlChart,
-            'maxDailyDownloads' => !empty($dlChart) ? max($dlChart['values']) : null,
+            'maxDailyDownloads' => !empty($dlChart) && \count($dlChart['values']) > 0 ? max($dlChart['values']) : null,
             'downloadsChartMonthly' => $dlChartMonthly,
-            'maxMonthlyDownloads' => !empty($dlChartMonthly) ? max($dlChartMonthly['values']) : null,
+            'maxMonthlyDownloads' => !empty($dlChartMonthly) && \count($dlChartMonthly['values']) > 0 ? max($dlChartMonthly['values']) : null,
             'downloadsStartDate' => $downloadsStartDate,
         ]);
     }

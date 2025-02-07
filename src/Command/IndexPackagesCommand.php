@@ -14,9 +14,11 @@ namespace App\Command;
 
 use Algolia\AlgoliaSearch\SearchClient;
 use App\Entity\Package;
+use App\Entity\PackageFreezeReason;
 use App\Model\DownloadManager;
 use App\Model\FavoriteManager;
 use Composer\Pcre\Preg;
+use Doctrine\DBAL\ArrayParameterType;
 use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
@@ -137,7 +139,7 @@ class IndexPackagesCommand extends Command
                 }
 
                 // delete spam packages from the search index
-                if ($package->isAbandoned() && $package->getReplacementPackage() === 'spam/spam') {
+                if ($package->isFrozen() && $package->getFreezeReason() === PackageFreezeReason::Spam) {
                     try {
                         $index->deleteObject($package->getName());
                         $idsToUpdate[] = $package->getId();
@@ -232,6 +234,10 @@ class IndexPackagesCommand extends Command
             $record['replacementPackage'] = '';
         }
 
+        if (in_array($package->getType(), ['php-ext', 'php-ext-zend'], true)) {
+            $record['extension'] = 1;
+        }
+
         $record['tags'] = $tags;
 
         return $record;
@@ -320,7 +326,7 @@ class IndexPackagesCommand extends Command
                         'ids' => $idsToUpdate,
                         'indexed' => $time,
                     ],
-                    ['ids' => Connection::PARAM_INT_ARRAY]
+                    ['ids' => ArrayParameterType::INTEGER]
                 );
 
                 // make sure that packages where crawledAt is set in far future do not get indexed repeatedly
@@ -330,7 +336,7 @@ class IndexPackagesCommand extends Command
                         'ids' => $idsToUpdate,
                         'tomorrow' => date('Y-m-d H:i:s', strtotime('+1day')),
                     ],
-                    ['ids' => Connection::PARAM_INT_ARRAY]
+                    ['ids' => ArrayParameterType::INTEGER]
                 );
             } catch (\Exception $e) {
                 if (!$retries) {

@@ -19,18 +19,20 @@ use App\Entity\User;
 use App\Form\Type\ProfileFormType;
 use App\Model\DownloadManager;
 use App\Model\FavoriteManager;
+use App\Security\UserNotifier;
 use Pagerfanta\Doctrine\ORM\QueryAdapter;
 use Pagerfanta\Pagerfanta;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
-use Symfony\Component\Routing\Annotation\Route;
+use Symfony\Component\Routing\Attribute\Route;
+use Symfony\Component\Security\Csrf\CsrfTokenManagerInterface;
 use Symfony\Component\Security\Http\Attribute\CurrentUser;
 use Symfony\Component\Routing\Generator\UrlGeneratorInterface;
 
 class ProfileController extends Controller
 {
     #[Route(path: '/profile/', name: 'my_profile')]
-    public function myProfile(Request $req, FavoriteManager $favMgr, DownloadManager $dlMgr, #[CurrentUser] User $user): Response
+    public function myProfile(Request $req, FavoriteManager $favMgr, DownloadManager $dlMgr, #[CurrentUser] User $user, CsrfTokenManagerInterface $csrfTokenManager): Response
     {
         $packages = $this->getUserPackages($req, $user);
         $lastGithubSync = $this->doctrine->getRepository(Job::class)->getLastGitHubSyncJob($user->getId());
@@ -45,6 +47,7 @@ class ProfileController extends Controller
         if (!count($packages)) {
             $data['deleteForm'] = $this->createFormBuilder([])->getForm()->createView();
         }
+        $data['rotateApiCsrfToken'] = $csrfTokenManager->getToken('rotate_api');
 
         return $this->render(
             'user/my_profile.html.twig',
@@ -112,18 +115,36 @@ class ProfileController extends Controller
     }
 
     #[Route(path: '/profile/edit', name: 'edit_profile')]
-    public function editAction(Request $request): Response
+    public function editAction(Request $request, UserNotifier $userNotifier): Response
     {
         $user = $this->getUser();
-        if (!is_object($user)) {
+        if (!$user instanceof User) {
             throw $this->createAccessDeniedException('This user does not have access to this section.');
         }
 
+        $oldEmail = $user->getEmail();
+        $oldUsername = $user->getUsername();
         $form = $this->createForm(ProfileFormType::class, $user);
 
         $form->handleRequest($request);
 
         if ($form->isSubmitted() && $form->isValid()) {
+            $diffs = array_filter([
+                $oldEmail !== $user->getEmail() ? 'email ('.$oldEmail.' => '.$user->getEmail().')' : null,
+                $oldUsername !== $user->getUsername() ? 'username ('.$oldUsername.' => '.$user->getUsername().')' : null,
+            ]);
+
+            if (!empty($diffs)) {
+                $reason = sprintf('Your %s has been changed', implode(' and ', $diffs));
+
+                if ($oldEmail !== $user->getEmail()) {
+                    $userNotifier->notifyChange($oldEmail, $reason);
+                    $user->resetPasswordRequest();
+                }
+
+                $userNotifier->notifyChange($user->getEmail(), $reason);
+            }
+
             $this->getEM()->persist($user);
             $this->getEM()->flush();
 
@@ -133,6 +154,25 @@ class ProfileController extends Controller
         return $this->render('user/edit.html.twig', [
             'form' => $form,
         ]);
+    }
+
+    #[Route(path: '/profile/token/rotate', name: 'rotate_token', methods: ['POST'])]
+    public function tokenRotateAction(Request $request, #[CurrentUser] User $user, UserNotifier $userNotifier): Response
+    {
+        if (!$this->isCsrfTokenValid('rotate_api', (string) $request->request->get('token'))) {
+            $this->addFlash('error', 'Invalid csrf token, try again.');
+            return $this->redirectToRoute('my_profile');
+        }
+
+        $user->initializeApiToken();
+        $user->initializeSafeApiToken();
+        $userNotifier->notifyChange($user->getEmail(), 'Your API tokens have been rotated');
+        $this->addFlash('success', 'Your API tokens have been rotated');
+
+        $this->getEM()->persist($user);
+        $this->getEM()->flush();
+
+        return $this->redirectToRoute('my_profile');
     }
 
     /**

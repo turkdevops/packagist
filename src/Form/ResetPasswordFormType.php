@@ -12,13 +12,31 @@
 
 namespace App\Form;
 
+use App\Entity\User;
+use App\Form\Type\InvisibleRecaptchaType;
+use App\Validator\NotProhibitedPassword;
 use App\Validator\Password;
+use App\Validator\RateLimitingRecaptcha;
+use App\Validator\TwoFactorCode;
 use Symfony\Component\Form\AbstractType;
 use Symfony\Component\Form\Extension\Core\Type\PasswordType;
+use Symfony\Component\Form\Extension\Core\Type\TextType;
 use Symfony\Component\Form\FormBuilderInterface;
+use Symfony\Component\OptionsResolver\OptionsResolver;
 
+/**
+ * @extends AbstractType<User>
+ */
 class ResetPasswordFormType extends AbstractType
 {
+    public function configureOptions(OptionsResolver $resolver): void
+    {
+        $resolver->setDefaults([
+            'data_class' => User::class,
+            'constraints' => [new NotProhibitedPassword()],
+        ]);
+    }
+
     public function buildForm(FormBuilderInterface $builder, array $options): void
     {
         $builder
@@ -32,5 +50,18 @@ class ResetPasswordFormType extends AbstractType
                 ],
             ])
         ;
+
+        if ($options['data']->isTotpAuthenticationEnabled()) {
+            $builder
+                ->add('twoFactorCode', TextType::class, [
+                    'label' => 'Two-Factor Code',
+                    'required' => true,
+                    'mapped' => false,
+                    'constraints' => [
+                        new TwoFactorCode($options['data']),
+                    ],
+                ]);
+            $builder->add('captcha', InvisibleRecaptchaType::class, ['only_show_after_increment_trigger' => true]);
+        }
     }
 }

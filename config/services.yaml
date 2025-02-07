@@ -26,14 +26,17 @@ services:
             $recaptchaVerifier: "@beelab_recaptcha2.verifier"
             'Monolog\Logger': '@logger'
             'Symfony\Contracts\EventDispatcher\EventDispatcherInterface $mainEventDispatcher': '@security.event_dispatcher.main'
+            'Symfony\Component\Security\Http\Logout\LogoutUrlGenerator': '@security.logout_url_generator'
 
             # params
             $dbUrl: '%env(DATABASE_URL)%'
+            $packagistHost: '%env(APP_HOSTNAME)%'
             $awsMetadata: '%aws_metadata%'
             $cacheDir: '%kernel.cache_dir%'
             $webDir: '%kernel.project_dir%/web/'
             $metadataDir: '%packagist_metadata_dir%'
             $trustedIpHeader: '%trusted_ip_header%'
+            $environment: '%kernel.environment%'
             $algoliaIndexName: '%env(ALGOLIA_INDEX_NAME)%'
             $githubWebhookSecret: '%env(APP_GITHUB_WEBHOOK_SECRET)%'
             $recaptchaEnabled: "%env(bool:APP_RECAPTCHA_ENABLED)%"
@@ -78,6 +81,9 @@ services:
     App\Package\V2Dumper:
         $buildDir: '%packagist_metadata_dir%'
 
+    App\Controller\PackageController:
+        $buildDir: '%packagist_metadata_dir%'
+
     App\Model\PackageManager:
         $options: { from: '%env(APP_MAILER_FROM_EMAIL)%', fromName: '%env(APP_MAILER_FROM_NAME)%' }
 
@@ -106,8 +112,6 @@ services:
     App\Security\TwoFactorAuthManager:
         public: true
         class: App\Security\TwoFactorAuthManager
-        arguments:
-            $options: { from: '%env(APP_MAILER_FROM_EMAIL)%', fromName: '%env(APP_MAILER_FROM_NAME)%' }
 
     App\Service\SecurityAdvisoryWorker:
         $sources:
@@ -117,4 +121,5 @@ services:
     Symfony\Component\HttpFoundation\Session\Storage\Handler\RedisSessionHandler:
         arguments: ['@snc_redis.cache', {prefix: 'sess:', ttl: 3600}]
 
-    Symfony\Component\HttpClient\NoPrivateNetworkHttpClient: ~
+    Symfony\Component\HttpClient\NoPrivateNetworkHttpClient:
+        autoconfigure: false
